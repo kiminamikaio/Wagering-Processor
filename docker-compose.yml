@@ -1,0 +1,64 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set in .env}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  ministack:
+    image: ministackorg/ministack
+    ports:
+      - "4566:4566"
+
+  sqs-init:
+    image: amazon/aws-cli
+    depends_on:
+      - ministack
+    entrypoint: ["/bin/sh", "-c"]
+    environment:
+      AWS_REGION: us-east-1
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_ENDPOINT: http://ministack:4566
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    command:
+      - |
+        set -eu
+        until aws sqs list-queues --endpoint-url "$${AWS_ENDPOINT}" >/dev/null 2>&1; do
+          echo "Waiting for MiniStack at $${AWS_ENDPOINT}..."
+          sleep 2
+        done
+        aws sqs create-queue \
+          --queue-name wager-transactions-dlq.fifo \
+          --attributes '{"FifoQueue":"true"}' \
+          --endpoint-url "$${AWS_ENDPOINT}" >/dev/null
+        DLQ_URL="$$(aws sqs get-queue-url \
+          --queue-name wager-transactions-dlq.fifo \
+          --endpoint-url "$${AWS_ENDPOINT}" \
+          --query QueueUrl --output text)"
+        DLQ_ARN="$$(aws sqs get-queue-attributes \
+          --queue-url "$${DLQ_URL}" \
+          --attribute-names QueueArn \
+          --endpoint-url "$${AWS_ENDPOINT}" \
+          --query 'Attributes.QueueArn' --output text)"
+        cat > /tmp/wager-transactions-attributes.json <<EOF
+        {"FifoQueue":"true","RedrivePolicy":"{\"deadLetterTargetArn\":\"$${DLQ_ARN}\",\"maxReceiveCount\":\"5\"}"}
+        EOF
+        aws sqs create-queue \
+          --queue-name wager-transactions.fifo \
+          --attributes file:///tmp/wager-transactions-attributes.json \
+          --endpoint-url "$${AWS_ENDPOINT}" >/dev/null
+
+volumes:
+  postgres_data:

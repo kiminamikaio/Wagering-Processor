@@ -5,3 +5,4 @@
 3. O ledger aceita apenas `INSERT`: nunca use `UPDATE` nem `DELETE`.
 4. Nenhum evento é publicado antes do commit; use uma transactional outbox.
 5. A idempotência é garantida por constraints únicas no banco, nunca em memória.
+6. O Bun está em /home/codespace/.bun/bin/bun. Nunca instale Bun via npm.

@@ -7,7 +7,10 @@
     "start:dev": "bun --watch src/main.ts",
     "start": "bun src/main.ts",
     "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "infra:up": "docker compose up -d",
+    "infra:down": "docker compose down",
+    "infra:reset": "docker compose down -v"
   },
   "dependencies": {
     "@nestjs/common": "^11.0.0",
