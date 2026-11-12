@@ -49,7 +49,7 @@ Ao reexecutar `up` após `down`, uma fixture de teste `PROCESSED` ficou sem o va
 
 Validação após a etapa 6B:
 
-1. `bun test` — 86 pass, 0 fail (369 assertions), com PostgreSQL real.
+1. `bun test` — 87 pass, 0 fail (369 assertions), com PostgreSQL real.
 2. `bun run typecheck` — sucesso (`tsc --noEmit`, exit code 0).
 
 Foram lidas as seções 6, 7, 8 e 11 de `DESAFIO.md` e as regras de `.github/copilot-instructions.md` antes da implementação da etapa 6B.

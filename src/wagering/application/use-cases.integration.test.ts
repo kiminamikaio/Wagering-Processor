@@ -291,7 +291,6 @@ describe("wagering application use cases", () => {
     expect(await ledgerCount(win.transactionId, "CREDIT")).toBe(1);
     await assertWalletMatchesLedger(wallet.id);
 
-    const tupleBeforeLoss = await walletTupleId(wallet.id);
     const versionBeforeLoss = (await unitOfWork.run((tx) =>
       tx.wallets.findByIdForUpdate(wallet.id),
     ))?.version;
@@ -304,13 +303,29 @@ describe("wagering application use cases", () => {
 
     expect(loss.status).toBe(WagerTransactionStatus.PROCESSED);
     expect(loss.balance).toEqual({ amount: "15.00", currency: "BRL" });
-    expect(await walletTupleId(wallet.id)).toBe(tupleBeforeLoss);
     expect((await unitOfWork.run((tx) => tx.wallets.findByIdForUpdate(wallet.id)))?.version)
       .toBe(versionBeforeLoss);
     expect(await ledgerCount(loss.transactionId)).toBe(0);
     expect((await readEvents(wallet.id, loss.transactionId)).map((row) => row.event_type))
       .toEqual(["WagerTransactionProcessed"]);
     await assertWalletMatchesLedger(wallet.id);
+  });
+
+  it("does not write the wallet row when processing LOSS", async () => {
+    const wallet = await createWallet.execute({
+      playerId: Bun.randomUUIDv7(),
+      initialBalance: { amount: "10.00", currency: "BRL" },
+    });
+    const tupleBeforeLoss = await walletTupleId(wallet.id);
+
+    await submitWager.execute(
+      createRequest(wallet, {
+        kind: WagerTransactionKind.LOSS,
+        money: { amount: "1.00", currency: "BRL" },
+      }),
+    );
+
+    expect(await walletTupleId(wallet.id)).toBe(tupleBeforeLoss);
   });
 
   it("persists player and currency mismatches as rejected transactions", async () => {
