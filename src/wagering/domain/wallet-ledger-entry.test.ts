@@ -44,7 +44,7 @@ describe("WalletLedgerEntry", () => {
     expect(() =>
       createEntry({
         balanceBefore: Money.from({ amount: "1.00", currency: "BRL" }),
-        balanceAfter: Money.from({ amount: "-1.50", currency: "BRL" }),
+        balanceAfter: Money.fromCents(-150n, "BRL"),
       }),
     ).toThrow(InvalidLedgerEntryError);
   });
