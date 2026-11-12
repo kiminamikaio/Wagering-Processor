@@ -15,6 +15,9 @@ interface WalletInput {
 interface WagerInput {
   id?: string;
   walletId: string;
+  playerId?: string | null;
+  roundId?: string | null;
+  gameId?: string | null;
   providerId?: string;
   externalTransactionId?: string;
   idempotencyKey?: string;
@@ -24,6 +27,8 @@ interface WagerInput {
   amountCents?: string;
   currency?: string;
   referenceTransactionId?: string;
+  referenceExternalTransactionId?: string | null;
+  failureCode?: string | null;
 }
 
 interface LedgerInput {
@@ -42,7 +47,7 @@ let orm: MikroORM;
 async function execute(
   em: EntityManager,
   sql: string,
-  params: string[] = [],
+  params: (string | null)[] = [],
 ): Promise<Record<string, unknown>[]> {
   return em.getConnection().execute(
     sql,
@@ -92,12 +97,17 @@ async function insertWager(em: EntityManager, input: WagerInput): Promise<string
   await execute(
     em,
     `INSERT INTO wager_transactions (
-      id, wallet_id, provider_id, external_transaction_id, idempotency_key,
-      payload_hash, kind, status, amount_cents, currency, reference_transaction_id
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, '')::uuid)`,
+      id, wallet_id, player_id, round_id, game_id, provider_id,
+      external_transaction_id, idempotency_key, payload_hash, kind, status,
+      amount_cents, currency, reference_transaction_id,
+      reference_external_transaction_id, failure_code
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, '')::uuid, ?, ?)`,
     [
       id,
       input.walletId,
+      input.playerId === undefined ? randomUUID() : input.playerId,
+      input.roundId === undefined ? "test-round" : input.roundId,
+      input.gameId === undefined ? "test-game" : input.gameId,
       input.providerId ?? randomUUID(),
       input.externalTransactionId ?? randomUUID(),
       input.idempotencyKey ?? randomUUID(),
@@ -107,6 +117,10 @@ async function insertWager(em: EntityManager, input: WagerInput): Promise<string
       input.amountCents ?? "1",
       input.currency ?? "USD",
       input.referenceTransactionId ?? "",
+      input.referenceExternalTransactionId === undefined
+        ? null
+        : input.referenceExternalTransactionId,
+      input.failureCode === undefined ? null : input.failureCode,
     ],
   );
 
@@ -194,6 +208,14 @@ describe("PostgreSQL schema constraints", () => {
       );
       expect(monetaryColumns.length).toBe(5);
       expect(monetaryColumns.every((column) => column.data_type === "bigint")).toBe(true);
+
+      const wagerId = await insertWager(em, { walletId });
+      const referenceAttempts = await execute(
+        em,
+        "SELECT reference_attempts FROM wager_transactions WHERE id = ?",
+        [wagerId],
+      );
+      expect(referenceAttempts[0]?.reference_attempts).toBe(0);
     });
   });
 
@@ -228,6 +250,15 @@ describe("PostgreSQL schema constraints", () => {
         await insertWager(em, { walletId, providerId, externalTransactionId });
       },
     );
+  });
+
+  it("requires player, round, and game identifiers on wagers", async () => {
+    for (const missingField of ["playerId", "roundId", "gameId"] as const) {
+      await expectConstraintFailure("not-null", async (em) => {
+        const walletId = await insertWallet(em);
+        await insertWager(em, { walletId, [missingField]: null });
+      });
+    }
   });
 
   it("enforces unique idempotency keys", async () => {
@@ -275,13 +306,47 @@ describe("PostgreSQL schema constraints", () => {
           kind: "REFUND",
           status: "PROCESSED",
           referenceTransactionId: referenceId,
+          referenceExternalTransactionId: "provider-reference",
         });
         await insertWager(em, {
           walletId,
           kind: "REFUND",
           status: "PROCESSED",
           referenceTransactionId: referenceId,
+          referenceExternalTransactionId: "provider-reference",
         });
+      },
+    );
+  });
+
+  it("requires an external reference for refunds and rollbacks", async () => {
+    for (const kind of ["REFUND", "ROLLBACK"]) {
+      await expectConstraintFailure(
+        "wager_transactions_reference_external_transaction_required",
+        async (em) => {
+          const walletId = await insertWallet(em);
+          await insertWager(em, { walletId, kind });
+        },
+      );
+    }
+  });
+
+  it("requires failure codes exactly for rejected or failed wagers", async () => {
+    for (const status of ["REJECTED", "FAILED"]) {
+      await expectConstraintFailure(
+        "wager_transactions_failure_code_matches_status",
+        async (em) => {
+          const walletId = await insertWallet(em);
+          await insertWager(em, { walletId, status });
+        },
+      );
+    }
+
+    await expectConstraintFailure(
+      "wager_transactions_failure_code_matches_status",
+      async (em) => {
+        const walletId = await insertWallet(em);
+        await insertWager(em, { walletId, failureCode: "INVALID_WAGER" });
       },
     );
   });
@@ -299,7 +364,7 @@ describe("PostgreSQL schema constraints", () => {
   });
 
   it("rejects invalid ledger directions", async () => {
-    await expectConstraintFailure("wallet_ledger_entries_direction_valid", async (em) => {
+    await expectConstraintFailure("wallet_ledger_entries_balance_arithmetic", async (em) => {
       const walletId = await insertWallet(em);
       const transactionId = await insertWager(em, { walletId });
       await insertLedger(em, { walletId, transactionId, direction: "UNKNOWN" });
@@ -384,19 +449,57 @@ describe("PostgreSQL schema constraints", () => {
     });
   });
 
+  it("blocks truncating the ledger", async () => {
+    await expectConstraintFailure("wallet_ledger_entries is append-only", async (em) => {
+      const walletId = await insertWallet(em);
+      const transactionId = await insertWager(em, { walletId });
+      await insertLedger(em, { walletId, transactionId });
+      await execute(em, "TRUNCATE wallet_ledger_entries");
+    });
+  });
+
   it("enforces inbox uniqueness per consumer and message", async () => {
     await expectConstraintFailure("inbox_messages_pkey", async (em) => {
-      const messageId = randomUUID();
+      const messageId = "provider-message-001";
       await execute(
         em,
-        "INSERT INTO inbox_messages (consumer_name, message_id, payload) VALUES (?, ?, '{}'::jsonb)",
-        ["test-consumer", messageId],
+        "INSERT INTO inbox_messages (consumer_name, message_id, payload_hash, payload) VALUES (?, ?, ?, '{}'::jsonb)",
+        ["test-consumer", messageId, "test-payload-hash"],
       );
       await execute(
         em,
-        "INSERT INTO inbox_messages (consumer_name, message_id, payload) VALUES (?, ?, '{}'::jsonb)",
-        ["test-consumer", messageId],
+        "INSERT INTO inbox_messages (consumer_name, message_id, payload_hash, payload) VALUES (?, ?, ?, '{}'::jsonb)",
+        ["test-consumer", messageId, "test-payload-hash"],
       );
+    });
+  });
+
+  it("requires an inbox payload hash and accepts text message identifiers", async () => {
+    await expectConstraintFailure("not-null", async (em) => {
+      await execute(
+        em,
+        "INSERT INTO inbox_messages (consumer_name, message_id, payload_hash, payload) VALUES (?, ?, ?, '{}'::jsonb)",
+        ["test-consumer", "provider-message-no-hash", null],
+      );
+    });
+
+    await withRollback(async (em) => {
+      await execute(
+        em,
+        "INSERT INTO inbox_messages (consumer_name, message_id, payload_hash, payload) VALUES (?, ?, ?, '{}'::jsonb)",
+        ["test-consumer", "provider-message-not-a-uuid", "test-payload-hash"],
+      );
+      const columns = await execute(
+        em,
+        `SELECT column_name, data_type
+         FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'inbox_messages'
+           AND column_name IN ('message_id', 'payload_hash')`,
+      );
+
+      expect(columns).toContainEqual({ column_name: "message_id", data_type: "text" });
+      expect(columns).toContainEqual({ column_name: "payload_hash", data_type: "text" });
     });
   });
 
@@ -412,5 +515,34 @@ describe("PostgreSQL schema constraints", () => {
 
     expect(rows).toHaveLength(1);
     expect(rows[0]?.indexdef).toContain("WHERE (published_at IS NULL)");
+  });
+
+  it("creates the pending-reference retry index", async () => {
+    const rows = await execute(
+      getOrm().em,
+      `SELECT indexdef
+       FROM pg_indexes
+       WHERE schemaname = current_schema()
+         AND tablename = 'wager_transactions'
+         AND indexname = 'wager_transactions_pending_reference_next_attempt_at_idx'`,
+    );
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.indexdef).toContain("(reference_next_attempt_at)");
+    expect(rows[0]?.indexdef).toContain("WHERE (status = 'PENDING_REFERENCE'::text)");
+  });
+
+  it("creates the wallet ledger ordering index", async () => {
+    const rows = await execute(
+      getOrm().em,
+      `SELECT indexdef
+       FROM pg_indexes
+       WHERE schemaname = current_schema()
+         AND tablename = 'wallet_ledger_entries'
+         AND indexname = 'wallet_ledger_entries_wallet_id_id_idx'`,
+    );
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.indexdef).toContain("(wallet_id, id)");
   });
 });

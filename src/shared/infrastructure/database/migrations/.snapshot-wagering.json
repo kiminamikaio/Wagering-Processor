@@ -24,7 +24,7 @@
         },
         "message_id": {
           "name": "message_id",
-          "type": "uuid",
+          "type": "text",
           "unsigned": false,
           "autoincrement": false,
           "primary": true,
@@ -36,7 +36,23 @@
           "default": null,
           "comment": null,
           "enumItems": [],
-          "mappedType": "uuid"
+          "mappedType": "text"
+        },
+        "payload_hash": {
+          "name": "payload_hash",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
         },
         "payload": {
           "name": "payload",
@@ -325,6 +341,54 @@
           "enumItems": [],
           "mappedType": "uuid"
         },
+        "player_id": {
+          "name": "player_id",
+          "type": "uuid",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "uuid"
+        },
+        "round_id": {
+          "name": "round_id",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
+        "game_id": {
+          "name": "game_id",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
         "provider_id": {
           "name": "provider_id",
           "type": "text",
@@ -482,6 +546,70 @@
           "enumItems": [],
           "mappedType": "uuid"
         },
+        "reference_external_transaction_id": {
+          "name": "reference_external_transaction_id",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
+        "failure_code": {
+          "name": "failure_code",
+          "type": "text",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "text"
+        },
+        "reference_attempts": {
+          "name": "reference_attempts",
+          "type": "int4",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": false,
+          "unique": false,
+          "length": null,
+          "precision": 32,
+          "scale": 0,
+          "default": "0",
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "integer"
+        },
+        "reference_next_attempt_at": {
+          "name": "reference_next_attempt_at",
+          "type": "timestamptz(6)",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": 6,
+          "precision": null,
+          "scale": null,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "datetime"
+        },
         "created_at": {
           "name": "created_at",
           "type": "timestamptz(6)",
@@ -530,6 +658,17 @@
         },
         {
           "columnNames": [
+            "reference_next_attempt_at"
+          ],
+          "composite": false,
+          "constraint": false,
+          "keyName": "wager_transactions_pending_reference_next_attempt_at_idx",
+          "unique": false,
+          "primary": false,
+          "expression": "CREATE INDEX wager_transactions_pending_reference_next_attempt_at_idx ON public.wager_transactions USING btree (reference_next_attempt_at) WHERE (status = 'PENDING_REFERENCE'::text)"
+        },
+        {
+          "columnNames": [
             "id"
           ],
           "composite": false,
@@ -568,6 +707,18 @@
           "columnName": "amount_cents",
           "definition": "CHECK ((amount_cents > 0))",
           "expression": "amount_cents > 0"
+        },
+        {
+          "name": "wager_transactions_failure_code_matches_status",
+          "columnName": "failure_code",
+          "definition": "CHECK (((status = ANY (ARRAY['REJECTED'::text, 'FAILED'::text])) = (failure_code IS NOT NULL)))",
+          "expression": "(status = ANY (ARRAY['REJECTED'::text, 'FAILED'::text])) = (failure_code IS NOT NULL)"
+        },
+        {
+          "name": "wager_transactions_reference_external_transaction_required",
+          "columnName": "kind",
+          "definition": "CHECK (((kind <> ALL (ARRAY['REFUND'::text, 'ROLLBACK'::text])) OR (reference_external_transaction_id IS NOT NULL)))",
+          "expression": "(kind <> ALL (ARRAY['REFUND'::text, 'ROLLBACK'::text])) OR (reference_external_transaction_id IS NOT NULL)"
         }
       ],
       "foreignKeys": {
@@ -751,6 +902,17 @@
         {
           "columnNames": [
             "wallet_id",
+            "id"
+          ],
+          "composite": true,
+          "constraint": false,
+          "keyName": "wallet_ledger_entries_wallet_id_id_idx",
+          "unique": false,
+          "primary": false
+        },
+        {
+          "columnNames": [
+            "wallet_id",
             "transaction_id"
           ],
           "composite": true,
@@ -775,9 +937,9 @@
         },
         {
           "name": "wallet_ledger_entries_balance_arithmetic",
-          "columnName": "direction",
-          "definition": "CHECK (((direction <> ALL (ARRAY['DEBIT'::text, 'CREDIT'::text])) OR ((direction = 'CREDIT'::text) AND (balance_after_cents = (balance_before_cents + amount_cents))) OR ((direction = 'DEBIT'::text) AND (balance_after_cents = (balance_before_cents - amount_cents)))))",
-          "expression": "(direction <> ALL (ARRAY['DEBIT'::text, 'CREDIT'::text])) OR ((direction = 'CREDIT'::text) AND (balance_after_cents = (balance_before_cents + amount_cents))) OR ((direction = 'DEBIT'::text) AND (balance_after_cents = (balance_before_cents - amount_cents)))"
+          "columnName": "balance_before_cents",
+          "definition": "CHECK ((((direction = 'CREDIT'::text) AND (balance_after_cents = (balance_before_cents + amount_cents))) OR ((direction = 'DEBIT'::text) AND (balance_after_cents = (balance_before_cents - amount_cents)))))",
+          "expression": "((direction = 'CREDIT'::text) AND (balance_after_cents = (balance_before_cents + amount_cents))) OR ((direction = 'DEBIT'::text) AND (balance_after_cents = (balance_before_cents - amount_cents)))"
         }
       ],
       "foreignKeys": {

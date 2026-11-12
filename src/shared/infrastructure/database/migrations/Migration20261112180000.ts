@@ -19,6 +19,9 @@ export class Migration20261112180000 extends Migration {
       CREATE TABLE wager_transactions (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         wallet_id UUID NOT NULL,
+        player_id UUID NOT NULL,
+        round_id TEXT NOT NULL,
+        game_id TEXT NOT NULL,
         provider_id TEXT NOT NULL,
         external_transaction_id TEXT NOT NULL,
         idempotency_key TEXT NOT NULL,
@@ -28,6 +31,10 @@ export class Migration20261112180000 extends Migration {
         amount_cents BIGINT NOT NULL,
         currency CHAR(3) NOT NULL,
         reference_transaction_id UUID,
+        reference_external_transaction_id TEXT,
+        failure_code TEXT,
+        reference_attempts INTEGER NOT NULL DEFAULT 0,
+        reference_next_attempt_at TIMESTAMPTZ,
         created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
         processed_at TIMESTAMPTZ,
         CONSTRAINT wager_transactions_wallet_id_foreign
@@ -41,12 +48,20 @@ export class Migration20261112180000 extends Migration {
         CONSTRAINT wager_transactions_kind_valid
           CHECK (kind IN ('OPENING', 'BET', 'WIN', 'LOSS', 'REFUND', 'ROLLBACK')),
         CONSTRAINT wager_transactions_status_valid
-          CHECK (status IN ('PENDING', 'PENDING_REFERENCE', 'PROCESSED', 'REJECTED', 'FAILED'))
+          CHECK (status IN ('PENDING', 'PENDING_REFERENCE', 'PROCESSED', 'REJECTED', 'FAILED')),
+        CONSTRAINT wager_transactions_reference_external_transaction_required
+          CHECK (kind NOT IN ('REFUND', 'ROLLBACK') OR reference_external_transaction_id IS NOT NULL),
+        CONSTRAINT wager_transactions_failure_code_matches_status
+          CHECK ((status IN ('REJECTED', 'FAILED')) = (failure_code IS NOT NULL))
       );
 
       CREATE UNIQUE INDEX wager_transactions_processed_reference_kind_unique
         ON wager_transactions (reference_transaction_id, kind)
         WHERE status = 'PROCESSED' AND kind IN ('REFUND', 'ROLLBACK');
+
+      CREATE INDEX wager_transactions_pending_reference_next_attempt_at_idx
+        ON wager_transactions (reference_next_attempt_at)
+        WHERE status = 'PENDING_REFERENCE';
 
       CREATE TABLE wallet_ledger_entries (
         id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -65,14 +80,15 @@ export class Migration20261112180000 extends Migration {
         CONSTRAINT wallet_ledger_entries_direction_valid CHECK (direction IN ('DEBIT', 'CREDIT')),
         CONSTRAINT wallet_ledger_entries_amount_positive CHECK (amount_cents > 0),
         CONSTRAINT wallet_ledger_entries_balance_arithmetic CHECK (
-          direction NOT IN ('DEBIT', 'CREDIT')
-          OR
           (direction = 'CREDIT' AND balance_after_cents = balance_before_cents + amount_cents)
           OR
           (direction = 'DEBIT' AND balance_after_cents = balance_before_cents - amount_cents)
         ),
         CONSTRAINT wallet_ledger_entries_balance_after_non_negative CHECK (balance_after_cents >= 0)
       );
+
+      CREATE INDEX wallet_ledger_entries_wallet_id_id_idx
+        ON wallet_ledger_entries (wallet_id, id);
 
       CREATE FUNCTION prevent_wallet_ledger_entries_mutation() RETURNS TRIGGER
         LANGUAGE plpgsql
@@ -87,9 +103,14 @@ export class Migration20261112180000 extends Migration {
         BEFORE UPDATE OR DELETE ON wallet_ledger_entries
         FOR EACH ROW EXECUTE FUNCTION prevent_wallet_ledger_entries_mutation();
 
+      CREATE TRIGGER wallet_ledger_entries_append_only_truncate
+        BEFORE TRUNCATE ON wallet_ledger_entries
+        FOR EACH STATEMENT EXECUTE FUNCTION prevent_wallet_ledger_entries_mutation();
+
       CREATE TABLE inbox_messages (
         consumer_name TEXT NOT NULL,
-        message_id UUID NOT NULL,
+        message_id TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
         payload JSONB NOT NULL,
         received_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
         processed_at TIMESTAMPTZ,
