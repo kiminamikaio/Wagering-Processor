@@ -44,6 +44,17 @@ function createTransaction(kind = WagerTransactionKind.BET): WagerTransaction {
   return WagerTransaction.create(props(kind));
 }
 
+function validateTransition(
+  transaction: WagerTransaction,
+  nextStatus: WagerTransactionStatus,
+): void {
+  const assertTransition = Reflect.get(transaction, "assertTransition");
+  if (typeof assertTransition !== "function") {
+    throw new Error("The transaction transition guard is unavailable.");
+  }
+  assertTransition.call(transaction, nextStatus);
+}
+
 describe("WagerTransaction", () => {
   it("creates PENDING transactions with free-form provider identifiers", () => {
     const transaction = createTransaction();
@@ -79,6 +90,7 @@ describe("WagerTransaction", () => {
   it("allows all transitions from PENDING", () => {
     const transitions: Array<{
       status: WagerTransactionStatus;
+      kind?: WagerTransactionKind;
       apply: (transaction: WagerTransaction) => void;
     }> = [
       {
@@ -87,6 +99,7 @@ describe("WagerTransaction", () => {
       },
       {
         status: WagerTransactionStatus.PENDING_REFERENCE,
+        kind: WagerTransactionKind.REFUND,
         apply: (transaction) => transaction.markPendingReference(),
       },
       {
@@ -100,7 +113,7 @@ describe("WagerTransaction", () => {
     ];
 
     for (const transition of transitions) {
-      const transaction = createTransaction();
+      const transaction = createTransaction(transition.kind);
       transition.apply(transaction);
       expect(transaction.status).toBe(transition.status);
     }
@@ -113,7 +126,8 @@ describe("WagerTransaction", () => {
     }> = [
       {
         status: WagerTransactionStatus.PROCESSED,
-        apply: (transaction) => transaction.markProcessed(undefined, processedAt),
+        apply: (transaction) =>
+          transaction.markProcessed("referenced-transaction", processedAt),
       },
       {
         status: WagerTransactionStatus.REJECTED,
@@ -126,17 +140,94 @@ describe("WagerTransaction", () => {
     ];
 
     for (const transition of transitions) {
-      const transaction = createTransaction();
+      const transaction = createTransaction(WagerTransactionKind.REFUND);
       transaction.markPendingReference();
       transition.apply(transaction);
       expect(transaction.status).toBe(transition.status);
     }
 
-    const stillPendingReference = createTransaction();
+    const stillPendingReference = createTransaction(WagerTransactionKind.REFUND);
     stillPendingReference.markPendingReference();
     expect(() => stillPendingReference.markPendingReference()).toThrow(
       InvalidTransactionStateError,
     );
+  });
+
+  it("enforces the complete state transition matrix", () => {
+    const statuses = Object.values(WagerTransactionStatus);
+    const validPairs = new Set([
+      `${WagerTransactionStatus.PENDING}:${WagerTransactionStatus.PROCESSED}`,
+      `${WagerTransactionStatus.PENDING}:${WagerTransactionStatus.REJECTED}`,
+      `${WagerTransactionStatus.PENDING}:${WagerTransactionStatus.FAILED}`,
+      `${WagerTransactionStatus.PENDING}:${WagerTransactionStatus.PENDING_REFERENCE}`,
+      `${WagerTransactionStatus.PENDING_REFERENCE}:${WagerTransactionStatus.PROCESSED}`,
+      `${WagerTransactionStatus.PENDING_REFERENCE}:${WagerTransactionStatus.REJECTED}`,
+      `${WagerTransactionStatus.PENDING_REFERENCE}:${WagerTransactionStatus.FAILED}`,
+    ]);
+
+    for (const currentStatus of statuses) {
+      for (const nextStatus of statuses) {
+        const transaction = WagerTransaction.rehydrate({
+          ...props(),
+          status: currentStatus,
+        });
+        const attempt = () => validateTransition(transaction, nextStatus);
+        const pair = `${currentStatus}:${nextStatus}`;
+
+        if (validPairs.has(pair)) {
+          expect(attempt).not.toThrow();
+        } else {
+          expect(attempt).toThrow(InvalidTransactionStateError);
+        }
+      }
+    }
+  });
+
+  it("requires an internal reference before processing refunds and rollbacks", () => {
+    for (const kind of [WagerTransactionKind.REFUND, WagerTransactionKind.ROLLBACK]) {
+      const transaction = createTransaction(kind);
+
+      expect(() => transaction.markProcessed(undefined, processedAt)).toThrow(
+        MissingReferenceError,
+      );
+      expect(transaction.status).toBe(WagerTransactionStatus.PENDING);
+      expect(transaction.referenceTransactionId).toBeUndefined();
+      expect(transaction.processedAt).toBeUndefined();
+    }
+  });
+
+  it("processes refunds and rollbacks when their internal reference is supplied", () => {
+    for (const kind of [WagerTransactionKind.REFUND, WagerTransactionKind.ROLLBACK]) {
+      const transaction = createTransaction(kind);
+
+      transaction.markProcessed("referenced-transaction", processedAt);
+
+      expect(transaction.status).toBe(WagerTransactionStatus.PROCESSED);
+      expect(transaction.referenceTransactionId).toBe("referenced-transaction");
+    }
+  });
+
+  it("only allows reference-requiring transactions to become pending reference", () => {
+    for (const kind of [
+      WagerTransactionKind.BET,
+      WagerTransactionKind.WIN,
+      WagerTransactionKind.LOSS,
+    ]) {
+      const transaction = createTransaction(kind);
+
+      expect(() => transaction.markPendingReference()).toThrow(
+        InvalidTransactionStateError,
+      );
+      expect(transaction.status).toBe(WagerTransactionStatus.PENDING);
+    }
+
+    for (const kind of [WagerTransactionKind.REFUND, WagerTransactionKind.ROLLBACK]) {
+      const transaction = createTransaction(kind);
+
+      transaction.markPendingReference();
+
+      expect(transaction.status).toBe(WagerTransactionStatus.PENDING_REFERENCE);
+    }
   });
 
   it("rejects every transition from terminal states", () => {

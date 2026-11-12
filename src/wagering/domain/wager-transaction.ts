@@ -26,6 +26,25 @@ export enum WagerTransactionStatus {
   FAILED = "FAILED",
 }
 
+const VALID_TRANSITIONS: Readonly<
+  Record<WagerTransactionStatus, readonly WagerTransactionStatus[]>
+> = {
+  [WagerTransactionStatus.PENDING]: [
+    WagerTransactionStatus.PROCESSED,
+    WagerTransactionStatus.REJECTED,
+    WagerTransactionStatus.FAILED,
+    WagerTransactionStatus.PENDING_REFERENCE,
+  ],
+  [WagerTransactionStatus.PENDING_REFERENCE]: [
+    WagerTransactionStatus.PROCESSED,
+    WagerTransactionStatus.REJECTED,
+    WagerTransactionStatus.FAILED,
+  ],
+  [WagerTransactionStatus.PROCESSED]: [],
+  [WagerTransactionStatus.REJECTED]: [],
+  [WagerTransactionStatus.FAILED]: [],
+};
+
 export interface CreateWagerTransactionProps {
   id: string;
   providerId: string;
@@ -139,6 +158,10 @@ export class WagerTransaction {
 
   markProcessed(referenceTransactionId: string | undefined, at: Date): void {
     this.assertTransition(WagerTransactionStatus.PROCESSED);
+    if (this.requiresReference() && referenceTransactionId === undefined) {
+      throw new MissingReferenceError();
+    }
+
     this._status = WagerTransactionStatus.PROCESSED;
     this._referenceTransactionId = referenceTransactionId;
     this._processedAtMilliseconds = at.getTime();
@@ -146,6 +169,13 @@ export class WagerTransaction {
 
   markPendingReference(): void {
     this.assertTransition(WagerTransactionStatus.PENDING_REFERENCE);
+    if (!this.requiresReference()) {
+      throw new InvalidTransactionStateError(
+        this._status,
+        WagerTransactionStatus.PENDING_REFERENCE,
+      );
+    }
+
     this._status = WagerTransactionStatus.PENDING_REFERENCE;
   }
 
@@ -216,14 +246,7 @@ export class WagerTransaction {
   }
 
   private assertTransition(nextStatus: WagerTransactionStatus): void {
-    const canTransition =
-      this._status === WagerTransactionStatus.PENDING
-        ? nextStatus !== WagerTransactionStatus.PENDING
-        : this._status === WagerTransactionStatus.PENDING_REFERENCE &&
-          nextStatus !== WagerTransactionStatus.PENDING &&
-          nextStatus !== WagerTransactionStatus.PENDING_REFERENCE;
-
-    if (!canTransition) {
+    if (!VALID_TRANSITIONS[this._status].includes(nextStatus)) {
       throw new InvalidTransactionStateError(this._status, nextStatus);
     }
   }
