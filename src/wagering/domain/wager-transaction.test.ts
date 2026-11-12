@@ -336,6 +336,7 @@ describe("WagerTransaction", () => {
       "AMOUNT_MISMATCH",
       "ALREADY_REVERSED",
       "CURRENCY_MISMATCH",
+      "PLAYER_MISMATCH",
     ]);
   });
 });

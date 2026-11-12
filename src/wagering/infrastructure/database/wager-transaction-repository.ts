@@ -1,12 +1,11 @@
 import { EntityManager } from "@mikro-orm/core";
 import { Money } from "../../../shared/domain/money";
 import { WagerTransactionRepository } from "../../application/ports/wagering-unit-of-work";
-import { CurrencyMismatchError } from "../../domain/errors";
 import { WagerTransaction } from "../../domain/wager-transaction";
-import { moneyToCents } from "./money-mapper";
+import { moneyFromCents, moneyToCents } from "./money-mapper";
 import { PersistenceMappingError } from "./persistence-errors";
 import { wagerTransactionFromRow } from "./row-mappers";
-import { executeRows, executeStatement } from "./sql";
+import { executeRows, executeStatement, requiredString } from "./sql";
 
 export class MikroOrmWagerTransactionRepository
   implements WagerTransactionRepository
@@ -17,16 +16,18 @@ export class MikroOrmWagerTransactionRepository
     providerId: string,
     externalTransactionId: string,
     idempotencyKey: string,
-  ): Promise<WagerTransaction | undefined> {
+  ) {
     const rows = await executeRows(
       this.em,
-      `SELECT id, wallet_id, player_id, round_id, game_id, provider_id,
-              external_transaction_id, idempotency_key, payload_hash, kind,
-              status, amount_cents, currency, reference_transaction_id,
-              reference_external_transaction_id, failure_code, created_at, processed_at
+      `SELECT wager_transactions.*,
+              wallets.currency AS observed_balance_currency
        FROM wager_transactions
-       WHERE idempotency_key = ?
-          OR (provider_id = ? AND external_transaction_id = ?)
+       JOIN wallets ON wallets.id = wager_transactions.wallet_id
+       WHERE wager_transactions.idempotency_key = ?
+          OR (
+            wager_transactions.provider_id = ?
+            AND wager_transactions.external_transaction_id = ?
+          )
        LIMIT 2`,
       [idempotencyKey, providerId, externalTransactionId],
     );
@@ -37,7 +38,17 @@ export class MikroOrmWagerTransactionRepository
       );
     }
 
-    return rows[0] === undefined ? undefined : wagerTransactionFromRow(rows[0]);
+    if (rows[0] === undefined) {
+      return undefined;
+    }
+
+    return {
+      transaction: wagerTransactionFromRow(rows[0]),
+      observedBalance: moneyFromCents(
+        requiredString(rows[0], "observed_balance_cents"),
+        requiredString(rows[0], "observed_balance_currency"),
+      ),
+    };
   }
 
   async insert(transaction: WagerTransaction): Promise<void> {
@@ -73,13 +84,6 @@ export class MikroOrmWagerTransactionRepository
   }
 
   async save(transaction: WagerTransaction, observedBalance: Money): Promise<void> {
-    if (transaction.money.currency !== observedBalance.currency) {
-      throw new CurrencyMismatchError(
-        transaction.money.currency,
-        observedBalance.currency,
-      );
-    }
-
     await executeStatement(
       this.em,
       `UPDATE wager_transactions

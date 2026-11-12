@@ -26,6 +26,8 @@ export class MikroOrmWageringUnitOfWork implements WageringUnitOfWork {
   constructor(private readonly em: EntityManager) {}
 
   run<T>(work: (tx: WageringTx) => Promise<T>): Promise<T> {
-    return this.em.transactional((em) => work(new MikroOrmWageringTx(em)));
+    return this.em
+      .fork()
+      .transactional((em) => work(new MikroOrmWageringTx(em)));
   }
 }

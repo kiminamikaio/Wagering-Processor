@@ -7,11 +7,24 @@ export interface WageringUnitOfWork {
   run<T>(work: (tx: WageringTx) => Promise<T>): Promise<T>;
 }
 
+export interface Clock {
+  now(): Date;
+}
+
+export interface IdGenerator {
+  next(): string;
+}
+
 export interface WageringTx {
   wallets: WalletRepository;
   transactions: WagerTransactionRepository;
   ledger: LedgerRepository;
   outbox: OutboxRepository;
+}
+
+export interface ExistingWagerTransaction {
+  transaction: WagerTransaction;
+  observedBalance: Money;
 }
 
 export interface WalletRepository {
@@ -25,7 +38,7 @@ export interface WagerTransactionRepository {
     providerId: string,
     externalTransactionId: string,
     idempotencyKey: string,
-  ): Promise<WagerTransaction | undefined>;
+  ): Promise<ExistingWagerTransaction | undefined>;
   insert(transaction: WagerTransaction): Promise<void>;
   save(transaction: WagerTransaction, observedBalance: Money): Promise<void>;
 }

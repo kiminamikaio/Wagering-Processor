@@ -28,6 +28,16 @@ Implementados em `src/wagering/domain/`:
 - Testes cobrem schema, round-trips de persistência, concorrência de versão, append-only do ledger, conversão monetária e canonicalização do hash.
 - Nenhum use case ou endpoint foi adicionado nesta etapa.
 
+### Etapa 6B — casos de uso
+
+- Adicionados os ports `Clock` e `IdGenerator`, com `SystemClock` e implementação `BunIdGenerator` usando UUIDv7. O Unit of Work agora cria um `EntityManager` forkado por execução.
+- A busca idempotente retorna a transação e o saldo originalmente observado, usando a moeda da wallet mesmo em rejeições por divergência de moeda.
+- Implementados os erros de aplicação, `PLAYER_MISMATCH` e os eventos de integração tipados, serializados como envelope JSON com valores monetários em `MoneyProps`.
+- `SubmitWagerTransactionUseCase` processa BET/WIN/LOSS, persiste rejeições, aplica replay idempotente, grava ledger e outbox atomicamente; REFUND/ROLLBACK/OPENING são rejeitados antes de abrir a transação.
+- `CreateWalletUseCase` cria wallets com ou sem saldo inicial; saldo positivo grava OPENING, ledger CREDIT e eventos na mesma transação.
+- Testes PostgreSQL cobrem processamento, replay e conflito, rejeições, eventos, criação de wallet e duas apostas simultâneas disputando o mesmo saldo. Ainda não foram adicionados controllers ou módulos NestJS.
+- Para a etapa 7: transações `PENDING_REFERENCE` podem não ter `observed_balance`; o replay deverá aceitar saldo observado ausente e a resposta HTTP será `202` sem saldo.
+
 ## Validação executada
 
 Sequência de migrations:
@@ -35,11 +45,11 @@ Sequência de migrations:
 1. `bun run migration:down` — sucesso.
 2. `bun run migration:up` — sucesso.
 
-Ao reexecutar `up` após `down`, uma fixture de teste `PROCESSED` ficou sem o valor observado removido pelo `down`; a fixture local foi revertida para `PENDING` e `up` concluiu. Os testes de persistência agora fazem rollback das próprias fixtures.
+Ao reexecutar `up` após `down`, uma fixture de teste `PROCESSED` ficou sem o valor observado removido pelo `down`; a fixture local foi revertida para `PENDING` e `up` concluiu. Como o Unit of Work agora usa um fork com transação própria, os testes de persistência usam identificadores aleatórios e não dependem de rollback externo.
 
-Validação após a etapa 6A:
+Validação após a etapa 6B:
 
-1. `bun test` — 72 pass, 0 fail (287 assertions), com PostgreSQL real.
+1. `bun test` — 86 pass, 0 fail (369 assertions), com PostgreSQL real.
 2. `bun run typecheck` — sucesso (`tsc --noEmit`, exit code 0).
 
-Foram lidas as seções 5, 6, 8 e 11 de `DESAFIO.md` e as regras de `.github/copilot-instructions.md` antes da implementação.
+Foram lidas as seções 6, 7, 8 e 11 de `DESAFIO.md` e as regras de `.github/copilot-instructions.md` antes da implementação da etapa 6B.

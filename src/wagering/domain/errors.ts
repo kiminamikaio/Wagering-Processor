@@ -11,6 +11,7 @@ export enum FailureCode {
   AMOUNT_MISMATCH = "AMOUNT_MISMATCH",
   ALREADY_REVERSED = "ALREADY_REVERSED",
   CURRENCY_MISMATCH = "CURRENCY_MISMATCH",
+  PLAYER_MISMATCH = "PLAYER_MISMATCH",
 }
 
 export class InsufficientBalanceError extends Error {
