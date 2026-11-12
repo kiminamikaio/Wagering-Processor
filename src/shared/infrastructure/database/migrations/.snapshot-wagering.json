@@ -641,6 +641,22 @@
           "comment": null,
           "enumItems": [],
           "mappedType": "datetime"
+        },
+        "observed_balance_cents": {
+          "name": "observed_balance_cents",
+          "type": "int8",
+          "unsigned": false,
+          "autoincrement": false,
+          "primary": false,
+          "nullable": true,
+          "unique": false,
+          "length": null,
+          "precision": 64,
+          "scale": 0,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "bigint"
         }
       },
       "name": "wager_transactions",
@@ -710,9 +726,21 @@
         },
         {
           "name": "wager_transactions_failure_code_matches_status",
-          "columnName": "failure_code",
+          "columnName": "status",
           "definition": "CHECK (((status = ANY (ARRAY['REJECTED'::text, 'FAILED'::text])) = (failure_code IS NOT NULL)))",
           "expression": "(status = ANY (ARRAY['REJECTED'::text, 'FAILED'::text])) = (failure_code IS NOT NULL)"
+        },
+        {
+          "name": "wager_transactions_observed_balance_non_negative",
+          "columnName": "observed_balance_cents",
+          "definition": "CHECK (((observed_balance_cents IS NULL) OR (observed_balance_cents >= 0)))",
+          "expression": "(observed_balance_cents IS NULL) OR (observed_balance_cents >= 0)"
+        },
+        {
+          "name": "wager_transactions_observed_balance_required",
+          "columnName": "status",
+          "definition": "CHECK (((status <> ALL (ARRAY['PROCESSED'::text, 'REJECTED'::text])) OR (observed_balance_cents IS NOT NULL)))",
+          "expression": "(status <> ALL (ARRAY['PROCESSED'::text, 'REJECTED'::text])) OR (observed_balance_cents IS NOT NULL)"
         },
         {
           "name": "wager_transactions_reference_external_transaction_required",

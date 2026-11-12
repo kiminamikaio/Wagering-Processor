@@ -18,19 +18,28 @@ Implementados em `src/wagering/domain/`:
 - `FailureCode` e erros de domínio tipados em arquivo próprio.
 - Testes unitários co-localizados; sem dependência de NestJS, MikroORM ou banco no domínio.
 
+### Etapa 6A — persistência
+
+- Nova migration `Migration20261112200000` adiciona `observed_balance_cents` com checks para não-negatividade e obrigatoriedade em transações `PROCESSED`/`REJECTED`; a migration anterior não foi alterada.
+- Portas `WageringUnitOfWork`, `WageringTx` e repositórios de wallet, transação, ledger e outbox em `src/wagering/application/ports/`.
+- Adaptadores MikroORM usam `EntityManager.transactional()` e SQL parametrizado; wallet usa `SELECT ... FOR UPDATE` e controle otimista de versão; o ledger só expõe `insert`.
+- Mapeamento de centavos centralizado: leitura de `BIGINT` como string seguida de `BigInt`, sem conversão monetária para `number`.
+- `computePayloadHash` gera SHA-256 de JSON canônico dos campos de negócio especificados, sem idempotency key nem metadados.
+- Testes cobrem schema, round-trips de persistência, concorrência de versão, append-only do ledger, conversão monetária e canonicalização do hash.
+- Nenhum use case ou endpoint foi adicionado nesta etapa.
+
 ## Validação executada
 
-Sequência de infraestrutura concluída na etapa anterior:
+Sequência de migrations:
 
-1. `bun run infra:reset` — sucesso.
-2. `bun run infra:up` — sucesso.
-3. `bun run migration:up` — sucesso.
-4. `bun run migration:down` — sucesso.
-5. `bun run migration:up` — sucesso.
+1. `bun run migration:down` — sucesso.
+2. `bun run migration:up` — sucesso.
 
-Validação após a etapa 5:
+Ao reexecutar `up` após `down`, uma fixture de teste `PROCESSED` ficou sem o valor observado removido pelo `down`; a fixture local foi revertida para `PENDING` e `up` concluiu. Os testes de persistência agora fazem rollback das próprias fixtures.
 
-1. `bun test` — 57 pass, 0 fail (199 assertions).
+Validação após a etapa 6A:
+
+1. `bun test` — 72 pass, 0 fail (287 assertions), com PostgreSQL real.
 2. `bun run typecheck` — sucesso (`tsc --noEmit`, exit code 0).
 
-Foram lidas as seções 5, 6 e 7 de `DESAFIO.md` e as regras de `.github/copilot-instructions.md` antes da implementação.
+Foram lidas as seções 5, 6, 8 e 11 de `DESAFIO.md` e as regras de `.github/copilot-instructions.md` antes da implementação.

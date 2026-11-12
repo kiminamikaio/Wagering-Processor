@@ -25,6 +25,7 @@ interface WagerInput {
   kind?: string;
   status?: string;
   amountCents?: string;
+  observedBalanceCents?: string | null;
   currency?: string;
   referenceTransactionId?: string;
   referenceExternalTransactionId?: string | null;
@@ -99,9 +100,9 @@ async function insertWager(em: EntityManager, input: WagerInput): Promise<string
     `INSERT INTO wager_transactions (
       id, wallet_id, player_id, round_id, game_id, provider_id,
       external_transaction_id, idempotency_key, payload_hash, kind, status,
-      amount_cents, currency, reference_transaction_id,
+      amount_cents, currency, observed_balance_cents, reference_transaction_id,
       reference_external_transaction_id, failure_code
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, '')::uuid, ?, ?)`,
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, '')::uuid, ?, ?)`,
     [
       id,
       input.walletId,
@@ -116,6 +117,7 @@ async function insertWager(em: EntityManager, input: WagerInput): Promise<string
       input.status ?? "PENDING",
       input.amountCents ?? "1",
       input.currency ?? "USD",
+      input.observedBalanceCents === undefined ? null : input.observedBalanceCents,
       input.referenceTransactionId ?? "",
       input.referenceExternalTransactionId === undefined
         ? null
@@ -206,7 +208,7 @@ describe("PostgreSQL schema constraints", () => {
            )
            AND column_name LIKE '%\\_cents' ESCAPE '\\'`,
       );
-      expect(monetaryColumns.length).toBe(5);
+      expect(monetaryColumns.length).toBe(6);
       expect(monetaryColumns.every((column) => column.data_type === "bigint")).toBe(true);
 
       const wagerId = await insertWager(em, { walletId });
@@ -300,6 +302,7 @@ describe("PostgreSQL schema constraints", () => {
           walletId,
           kind: "BET",
           status: "PROCESSED",
+          observedBalanceCents: "0",
         });
         await insertWager(em, {
           walletId,
@@ -307,6 +310,7 @@ describe("PostgreSQL schema constraints", () => {
           status: "PROCESSED",
           referenceTransactionId: referenceId,
           referenceExternalTransactionId: "provider-reference",
+          observedBalanceCents: "0",
         });
         await insertWager(em, {
           walletId,
@@ -314,9 +318,36 @@ describe("PostgreSQL schema constraints", () => {
           status: "PROCESSED",
           referenceTransactionId: referenceId,
           referenceExternalTransactionId: "provider-reference",
+          observedBalanceCents: "0",
         });
       },
     );
+  });
+
+  it("rejects negative observed wager balances", async () => {
+    await expectConstraintFailure(
+      "wager_transactions_observed_balance_non_negative",
+      async (em) => {
+        const walletId = await insertWallet(em);
+        await insertWager(em, { walletId, observedBalanceCents: "-1" });
+      },
+    );
+  });
+
+  it("requires observed balances for processed and rejected wagers", async () => {
+    for (const status of ["PROCESSED", "REJECTED"]) {
+      await expectConstraintFailure(
+        "wager_transactions_observed_balance_required",
+        async (em) => {
+          const walletId = await insertWallet(em);
+          await insertWager(em, {
+            walletId,
+            status,
+            failureCode: status === "REJECTED" ? "INSUFFICIENT_FUNDS" : null,
+          });
+        },
+      );
+    }
   });
 
   it("requires an external reference for refunds and rollbacks", async () => {
