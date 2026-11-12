@@ -10,9 +10,14 @@
     "typecheck": "tsc --noEmit",
     "infra:up": "docker compose up -d",
     "infra:down": "docker compose down",
-    "infra:reset": "docker compose down -v"
+    "infra:reset": "docker compose down -v",
+    "migration:up": "mikro-orm migration:up --config ./src/shared/infrastructure/database/mikro-orm.config.ts",
+    "migration:down": "mikro-orm migration:down --config ./src/shared/infrastructure/database/mikro-orm.config.ts"
   },
   "dependencies": {
+    "@mikro-orm/core": "^6",
+    "@mikro-orm/migrations": "^6",
+    "@mikro-orm/postgresql": "^6",
     "@nestjs/common": "^11.0.0",
     "@nestjs/core": "^11.0.0",
     "@nestjs/platform-express": "^11.0.0",
@@ -20,8 +25,11 @@
     "rxjs": "^7.8.1"
   },
   "devDependencies": {
+    "@mikro-orm/cli": "^6",
     "@types/bun": "^1.2.0",
     "@types/node": "^22.0.0",
+    "dotenv": "^18.0.10",
+    "ts-node": "^10.9.2",
     "typescript": "^5.8.0"
   }
 }
