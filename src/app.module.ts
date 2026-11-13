@@ -19,6 +19,13 @@ import { MikroOrmWageringUnitOfWork } from "./wagering/infrastructure/database/w
 import mikroOrmConfig from "./shared/infrastructure/database/mikro-orm.config";
 import { WalletsController } from "./wallets.controller";
 import { ProviderWageringController, WageringController } from "./wagering.controller";
+import {
+  createOutboxSqsClient,
+  outboxPublisherOptionsFromEnvironment,
+  SqsOutboxPublisher,
+} from "./wagering/infrastructure/outbox/sqs-outbox-publisher";
+
+const SQS_CLIENT = Symbol("SQS_CLIENT");
 
 @Injectable()
 class MikroOrmLifecycle implements OnApplicationShutdown {
@@ -40,6 +47,27 @@ class MikroOrmLifecycle implements OnApplicationShutdown {
     {
       provide: MikroORM,
       useFactory: () => MikroORM.init(mikroOrmConfig),
+    },
+    {
+      provide: SQS_CLIENT,
+      useFactory: createOutboxSqsClient,
+    },
+    {
+      provide: SqsOutboxPublisher,
+      useFactory: (
+        orm: MikroORM,
+        client: ReturnType<typeof createOutboxSqsClient>,
+        clock: Clock,
+      ) =>
+        new SqsOutboxPublisher(
+          orm.em,
+          client,
+          process.env.OUTBOX_INSTANCE_ID ?? crypto.randomUUID(),
+          clock,
+          outboxPublisherOptionsFromEnvironment(),
+          true,
+        ),
+      inject: [MikroORM, SQS_CLIENT, CLOCK],
     },
     MikroOrmLifecycle,
     {

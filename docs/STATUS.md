@@ -63,6 +63,15 @@ Implementados em `src/wagering/domain/`:
 - `src/multi-instance.e2e.test.ts` sobe três processos reais com Bun e distribui as requisições entre eles; cada cenário verifica banco, outbox e invariantes do ledger.
 - Respostas HTTP `422` incluem `idempotentReplay`, permitindo distinguir a rejeição original do replay; no replay, o corpo é idêntico ao original exceto pelo campo `idempotentReplay` agora verdadeiro.
 
+### Etapa 10 — publicador da Transactional Outbox
+
+- Adicionado `@aws-sdk/client-sqs` e configuração por ambiente para endpoint, região, credenciais e URL da fila FIFO `wagering-events.fifo`; o `sqs-init` cria a fila com deduplicação por conteúdo desativada.
+- A migration reversível `Migration20261113170000` adiciona `locked_by`, `locked_until` e `last_error` à outbox sem alterar migrations anteriores.
+- `SqsOutboxPublisher` reivindica linhas com `FOR UPDATE SKIP LOCKED` em transação curta, publica fora da transação e marca o sucesso somente se o lease ainda pertencer à instância. Falhas registram resumo sem payload, incrementam tentativas e usam backoff exponencial com jitter (máximo de cinco minutos).
+- O publisher roda em loop por padrão, configurável por variáveis `OUTBOX_PUBLISHER_*`; `main.ts` habilita hooks de shutdown para concluir o lote ativo. Relógio, ID da instância e sender são substituíveis nos testes.
+- Testes de integração com PostgreSQL e MiniStack cobrem envelope e commit atômico, concorrência entre publishers, lease, reenvio após falha, retry, tipos de evento e reinício de instância.
+- A entrega é at-least-once: consumidores devem deduplicar por `eventId`. A ordem por wallet com vários publishers é melhor esforço; consumidores que exigem ordenação podem usar a versão do wallet.
+
 ## Validação executada
 
 Sequência de migrations:
@@ -87,4 +96,9 @@ Validação da etapa 8:
 Validação da etapa 9:
 
 1. `bun test` — três execuções consecutivas: cada uma com 110 testes aprovados e 0 falhas (1046 assertions).
+2. `bun run typecheck` — sucesso (`tsc --noEmit`, exit code 0).
+
+Validação da etapa 10:
+
+1. `bun test` — três execuções consecutivas: cada uma com 118 testes aprovados e 0 falhas.
 2. `bun run typecheck` — sucesso (`tsc --noEmit`, exit code 0).

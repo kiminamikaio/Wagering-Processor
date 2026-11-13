@@ -1,3 +1,4 @@
+import "./test-support/disable-outbox-publisher";
 import "reflect-metadata";
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { INestApplication } from "@nestjs/common";

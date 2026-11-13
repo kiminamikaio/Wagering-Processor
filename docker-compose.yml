@@ -59,6 +59,10 @@ services:
           --queue-name wager-transactions.fifo \
           --attributes file:///tmp/wager-transactions-attributes.json \
           --endpoint-url "$${AWS_ENDPOINT}" >/dev/null
+        aws sqs create-queue \
+          --queue-name wagering-events.fifo \
+          --attributes '{"FifoQueue":"true","ContentBasedDeduplication":"false"}' \
+          --endpoint-url "$${AWS_ENDPOINT}" >/dev/null
 
 volumes:
   postgres_data:
