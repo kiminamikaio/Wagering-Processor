@@ -54,6 +54,15 @@ Implementados em `src/wagering/domain/`:
 - Mapa HTTP: processamento e replay `200`; wallet criada `201`; `PENDING_REFERENCE` `202` sem saldo; payload inválido `400`; recurso ausente `404`; conflito de idempotência e wallet duplicada `409`; rejeição `422` com `failureCode`; falha transitória do banco `503` com `Retry-After`.
 - Migration adiciona sequência identity ao ledger e índice de consulta por wallet/sequência. E2E usa NestJS real, `app.listen(0)`, `fetch` e PostgreSQL, cobrindo criação/duplicidade, BET/replay/conflito, rejeição sem saldo, referência pendente, validação, 404 e paginação.
 
+### Etapa 9 — concorrência HTTP e multi-instância
+
+- Configurados o pool PostgreSQL por `DB_POOL_MAX` (padrão 10) e o `lock_timeout` local por `DB_LOCK_TIMEOUT_MS` (padrão 5000 ms); timeout de lock mantém resposta transitória HTTP `503` com `Retry-After`.
+- `main.ts` já aceitava `PORT` com padrão 3000; preservada a implementação existente.
+- Adicionado helper compartilhado de teste que compara saldo com o ledger, valida continuidade dos saldos por `seq` e exige `wallet.version == 1 + lançamentos não-OPENING` (o crédito `OPENING` inicial não incrementa a versão).
+- `src/concurrency.e2e.test.ts` cobre concorrência HTTP real, replay, payload divergente, mistura BET/WIN, wallets independentes, estornos concorrentes e referência pendente.
+- `src/multi-instance.e2e.test.ts` sobe três processos reais com Bun e distribui as requisições entre eles; cada cenário verifica banco, outbox e invariantes do ledger.
+- Respostas HTTP `422` incluem `idempotentReplay`, permitindo distinguir a rejeição original do replay; no replay, o corpo é idêntico ao original exceto pelo campo `idempotentReplay` agora verdadeiro.
+
 ## Validação executada
 
 Sequência de migrations:
@@ -73,4 +82,9 @@ Foram lidas as seções 6, 7, 8 e 11 de `DESAFIO.md` e as regras de `.github/cop
 Validação da etapa 8:
 
 1. `bun test` — 101 testes, 0 falhas, com PostgreSQL real.
+2. `bun run typecheck` — sucesso (`tsc --noEmit`, exit code 0).
+
+Validação da etapa 9:
+
+1. `bun test` — três execuções consecutivas: cada uma com 110 testes aprovados e 0 falhas (1046 assertions).
 2. `bun run typecheck` — sucesso (`tsc --noEmit`, exit code 0).

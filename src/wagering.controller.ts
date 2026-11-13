@@ -83,6 +83,7 @@ export class WageringController {
         transactionId: result.transactionId,
         status: result.status,
         failureCode,
+        idempotentReplay: result.idempotentReplay,
       };
     }
     return result;

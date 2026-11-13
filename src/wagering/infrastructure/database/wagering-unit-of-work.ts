@@ -8,6 +8,20 @@ import { MikroOrmOutboxRepository } from "./outbox-repository";
 import { MikroOrmWalletRepository } from "./wallet-repository";
 import { MikroOrmWagerTransactionRepository } from "./wager-transaction-repository";
 
+function lockTimeoutMilliseconds(): number {
+  const rawValue = process.env.DB_LOCK_TIMEOUT_MS;
+  if (rawValue === undefined) {
+    return 5_000;
+  }
+
+  const value = Number(rawValue);
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error("DB_LOCK_TIMEOUT_MS must be a positive integer.");
+  }
+
+  return value;
+}
+
 class MikroOrmWageringTx implements WageringTx {
   readonly wallets: MikroOrmWalletRepository;
   readonly transactions: MikroOrmWagerTransactionRepository;
@@ -28,6 +42,16 @@ export class MikroOrmWageringUnitOfWork implements WageringUnitOfWork {
   run<T>(work: (tx: WageringTx) => Promise<T>): Promise<T> {
     return this.em
       .fork()
-      .transactional((em) => work(new MikroOrmWageringTx(em)));
+      .transactional(async (em) => {
+        await em
+          .getConnection()
+          .execute(
+            "SELECT set_config('lock_timeout', ?, true)",
+            [`${lockTimeoutMilliseconds()}ms`],
+            "run",
+            em.getTransactionContext(),
+          );
+        return work(new MikroOrmWageringTx(em));
+      });
   }
 }
