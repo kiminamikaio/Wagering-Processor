@@ -7,6 +7,13 @@ export class WalletNotFoundError extends Error {
   }
 }
 
+export class WagerTransactionNotFoundError extends Error {
+  constructor() {
+    super("Wager transaction was not found.");
+    this.name = "WagerTransactionNotFoundError";
+  }
+}
+
 export class IdempotencyConflictError extends Error {
   constructor(idempotencyKey: string) {
     super(`Idempotency key ${idempotencyKey} was used with a different payload.`);

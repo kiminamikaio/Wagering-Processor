@@ -570,10 +570,10 @@ describe("PostgreSQL schema constraints", () => {
        FROM pg_indexes
        WHERE schemaname = current_schema()
          AND tablename = 'wallet_ledger_entries'
-         AND indexname = 'wallet_ledger_entries_wallet_id_id_idx'`,
+         AND indexname = 'wallet_ledger_entries_wallet_id_seq_idx'`,
     );
 
     expect(rows).toHaveLength(1);
-    expect(rows[0]?.indexdef).toContain("(wallet_id, id)");
+    expect(rows[0]?.indexdef).toContain("(wallet_id, seq DESC)");
   });
 });

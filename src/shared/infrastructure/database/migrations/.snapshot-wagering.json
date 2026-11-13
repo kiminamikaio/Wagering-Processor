@@ -911,6 +911,23 @@
           "comment": null,
           "enumItems": [],
           "mappedType": "datetime"
+        },
+        "seq": {
+          "name": "seq",
+          "type": "int8",
+          "unsigned": true,
+          "autoincrement": true,
+          "primary": false,
+          "nullable": false,
+          "unique": true,
+          "length": null,
+          "precision": 64,
+          "scale": 0,
+          "default": null,
+          "comment": null,
+          "enumItems": [],
+          "mappedType": "bigint",
+          "generated": "identity"
         }
       },
       "name": "wallet_ledger_entries",
@@ -928,12 +945,22 @@
         },
         {
           "columnNames": [
+            "seq"
+          ],
+          "composite": false,
+          "constraint": false,
+          "keyName": "wallet_ledger_entries_seq_unique",
+          "unique": true,
+          "primary": false
+        },
+        {
+          "columnNames": [
             "wallet_id",
-            "id"
+            "seq"
           ],
           "composite": true,
           "constraint": false,
-          "keyName": "wallet_ledger_entries_wallet_id_id_idx",
+          "keyName": "wallet_ledger_entries_wallet_id_seq_idx",
           "unique": false,
           "primary": false
         },

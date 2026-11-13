@@ -46,6 +46,14 @@ Implementados em `src/wagering/domain/`:
 - Decisão: cada transação referenciada pode ter no máximo um estorno processado no total, seja `REFUND` ou `ROLLBACK`; migration ajusta o índice único parcial como segunda proteção contra concorrência.
 - Testes PostgreSQL cobrem REFUND de BET, ROLLBACK de WIN, referência fora de ordem, rejeições de referência/valor, overdraw e corrida REFUND/ROLLBACK sobre a mesma BET. O worker da etapa 12 não foi criado.
 
+### Etapa 8 — API HTTP NestJS
+
+- `AppModule` registra controllers, casos de uso, `MikroORM`, Unit of Work, relógio, gerador de IDs e repositório de consultas. `AuthGuard` no-op protege wallet e wagering; health segue público. A decisão de autenticação futura está em `ARCHITECTURE.md`.
+- Implementados `POST /wallets`, `GET /wallets/:walletId`, `GET /wallets/:walletId/ledger`, `POST /wagering/transactions`, `GET /wagering/transactions/:transactionId` e a consulta por provider/ID externo. Cursor do ledger é base64 da sequência monotônica; limit padrão 50 e máximo 100.
+- `Idempotency-Key` é obrigatório; campos monetários HTTP exigem strings decimais com duas casas. Um exception filter global padroniza erros como `{ error: { code, message } }`.
+- Mapa HTTP: processamento e replay `200`; wallet criada `201`; `PENDING_REFERENCE` `202` sem saldo; payload inválido `400`; recurso ausente `404`; conflito de idempotência e wallet duplicada `409`; rejeição `422` com `failureCode`; falha transitória do banco `503` com `Retry-After`.
+- Migration adiciona sequência identity ao ledger e índice de consulta por wallet/sequência. E2E usa NestJS real, `app.listen(0)`, `fetch` e PostgreSQL, cobrindo criação/duplicidade, BET/replay/conflito, rejeição sem saldo, referência pendente, validação, 404 e paginação.
+
 ## Validação executada
 
 Sequência de migrations:
@@ -61,3 +69,8 @@ Validação após a etapa 6B:
 2. `bun run typecheck` — sucesso (`tsc --noEmit`, exit code 0).
 
 Foram lidas as seções 6, 7, 8 e 11 de `DESAFIO.md` e as regras de `.github/copilot-instructions.md` antes da implementação da etapa 6B.
+
+Validação da etapa 8:
+
+1. `bun test` — 101 testes, 0 falhas, com PostgreSQL real.
+2. `bun run typecheck` — sucesso (`tsc --noEmit`, exit code 0).
