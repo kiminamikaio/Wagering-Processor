@@ -1,167 +1,210 @@
-# Architecture decisions
+# Decisões de arquitetura
 
-## Authentication
+## Visão geral
 
-Authentication is intentionally deferred because it is outside the challenge's
-scored scope. `AuthGuard` is currently a no-op extension point applied to wallet
-and wagering endpoints; health endpoints remain public. A future deployment
-should validate bearer tokens issued by an external OIDC identity provider
-(such as Keycloak or Zitadel), rather than implement password storage in this
-service.
+```text
+HTTP ─┐
+      ├─> caso de uso ── transação SQL ── PostgreSQL
+SQS ──┘                    │                 ├─ wallets
+                           │                 ├─ wager_transactions
+                           │                 ├─ wallet_ledger_entries (append-only)
+                           │                 ├─ inbox_messages
+                           │                 └─ outbox_messages
+                           │
+                           └─ commit
+                                │
+                   publicador da outbox ──> SQS de saída
 
-## Concurrency
+worker de referências pendentes ──> caso de uso/serviço de reversão
+```
 
-The concurrency unit is `walletId`. Every wagering transaction runs in a SQL
-transaction and locks its wallet row with `SELECT ... FOR UPDATE` before reading
-or changing the balance. A pessimistic lock is deliberate: a hot wallet is
-expected to contend, and optimistic locking would turn normal contention into
-conflicts that require retries, complicating idempotency and increasing work
-under load. Transactions for different wallets can still proceed independently.
+HTTP e SQS compartilham `SubmitWagerTransactionUseCase`. As alterações financeiras,
+ledger, estado da transação, inbox (quando a entrada é SQS) e outbox são gravados
+atomicamente no PostgreSQL. O publicador envia eventos somente depois do commit;
+o worker periódico revisita reversões cuja referência ainda não chegou.
 
-Each transaction sets PostgreSQL's local `lock_timeout` to
-`DB_LOCK_TIMEOUT_MS` (default 5000 ms). A PostgreSQL lock-timeout error is
-transient and the HTTP exception filter responds with `503` and `Retry-After`,
-so a caller can safely retry using its idempotency key.
+## MikroORM e valores monetários
 
-The wallet starts at version 1. An initial positive balance is represented by
-an `OPENING` credit, which does not increment the wallet version. Later
-balance-changing ledger entries advance the version once.
+MikroORM fornece a conexão PostgreSQL, transações, contexto de `EntityManager`,
+migrations e configuração de pool. As operações financeiras usam repositórios
+explícitos e SQL parametrizado onde é necessário controlar locks ou `SKIP LOCKED`;
+isso mantém as garantias visíveis sem depender de um estado ORM em memória.
 
-The lock is enforced by PostgreSQL, not by process-local state. Consequently,
-any number of service instances sharing the same database serialize operations
-on the same wallet while retaining parallelism across wallets. SQS FIFO ordering
-by wallet is a useful optimization that can reduce lock contention, but the
-database constraints and wallet lock remain the final correctness guarantee.
+`Money` é imutável e mantém centavos inteiros como `bigint` no domínio. O banco
+armazena centavos em colunas PostgreSQL `BIGINT`; o mapper lê como string e
+converte para `BigInt`, sem passar por `number`. Na API e nos eventos, o valor é
+uma string decimal de duas casas e a moeda é independente.
 
-## Out-of-order references
+Não usamos `number`, pois inteiros grandes perdem exatidão além da faixa segura
+do JavaScript e operações fracionárias introduzem arredondamento binário. Não
+usamos `Decimal` no domínio nem `NUMERIC` para persistência: escala fixa de
+centavos permite aritmética exata com `bigint`, checks simples no banco e
+serialização explícita. O trade-off é que qualquer escala além de duas casas
+exigiria uma mudança deliberada de representação e contrato.
 
-A `REFUND` or `ROLLBACK` whose reference has not arrived is committed as
-`PENDING_REFERENCE` with `reference_attempts = 0` and its first retry scheduled
-one second later. `WagerTransactionPendingReference` is written to the outbox
-only at this transition, never on a retry.
+## Esquema e invariantes no banco
 
-The worker claims due transaction IDs in batches using
-`FOR UPDATE SKIP LOCKED`, then commits that short claim transaction. Each
-candidate is handled in its own SQL transaction: it locks the wallet first,
-then the pending wager transaction, and rechecks both its status and due time.
-The lock order matches the HTTP/SQS use case and prevents a stale batch claim
-from causing a duplicate attempt or a reversal after another worker resolved it.
+As migrations estão em `src/shared/infrastructure/database/migrations/`.
+Constraints, índices e triggers são parte da garantia financeira, não apenas
+validações da aplicação:
 
-Missing references use exponential backoff with jitter, starting at one second
-and capped at five minutes. Processing stops at the first of eight unsuccessful
-attempts (`REFERENCE_MAX_ATTEMPTS`) or 15 minutes after `created_at`
-(`REFERENCE_TTL`, milliseconds). Eight attempts allow rapid retries while
-bounding database work; the 15-minute TTL gives a delayed provider event time to
-arrive without leaving stale transactions pending indefinitely. Both limits
-are configurable. When either limit is reached, the transaction is rejected
-with `REFERENCE_NOT_FOUND`, without a ledger entry, and
-`WagerTransactionRejected` is added to the same transaction's outbox.
+- `wallets`: chave única `(player_id, currency)`, saldo não negativo e versão
+  maior ou igual a 1.
+- `wager_transactions`: chaves únicas para `idempotency_key` e para
+  `(provider_id, external_transaction_id)`, valor positivo, status/tipo válidos,
+  referência externa obrigatória em REFUND/ROLLBACK e `failure_code` coerente com
+  status. Saldo observado é não negativo e obrigatório em PROCESSED/REJECTED.
+- Índice parcial em transações `PENDING_REFERENCE` para buscar vencimentos.
+- Índice parcial único limita a **uma reversão processada no total por transação
+  de referência**, seja REFUND ou ROLLBACK.
+- `wallet_ledger_entries`: chave única `(wallet_id, transaction_id)`, direção e
+  valor válidos, check aritmético entre saldo anterior, valor e saldo posterior,
+  saldo posterior não negativo e índice por wallet/sequência.
+- Trigger rejeita `UPDATE`, `DELETE` e `TRUNCATE` no ledger. O repositório de
+  ledger expõe apenas `INSERT`.
+- Inbox tem chave primária `(consumer_name, message_id)`. Outbox tem índice
+  parcial para mensagens não publicadas e vencidas, além de lease de publisher.
 
-When the reference exists, the worker and request use case call the same
-application service for reference validation, balance changes, ledger writes,
-and processed/rejected outbox events. The database permits at most one
-processed reversal in total for a referenced transaction, whether the reversal
-is a `REFUND` or `ROLLBACK`. Set `PENDING_REFERENCE_WORKER_ENABLED=true` to
-start the loop; `runOnce()` remains available for controlled execution. Shutdown
-waits for the active batch to finish.
+O saldo da wallet não pode ser negativo mesmo diante de uma falha de aplicação:
+há constraint no banco, validação no domínio e lock transacional. Não existe
+reconciliação automática; uma divergência é sinalizada para investigação.
 
-## Transactional Outbox
+## Concorrência e ordem de locks
 
-The application does not publish an integration event directly while handling
-a wager. A direct publish and a database commit are two independent writes:
-either can succeed while the other fails, leaving a committed balance change
-without an event or an event for a rolled-back change. Instead, the event
-envelope is inserted into `outbox_messages` in the same SQL transaction as the
-wallet, ledger, and wager transaction updates.
+A unidade de concorrência é `walletId`. Cada operação financeira abre uma
+transação SQL, define `lock_timeout` local (`DB_LOCK_TIMEOUT_MS`, padrão
+5000 ms), bloqueia a wallet com `SELECT ... FOR UPDATE`, depois resolve/bloqueia
+a transação relacionada e grava wallet, ledger e outbox antes do commit. A ordem
+de locks é **wallet → transação**. O worker faz um claim curto de IDs vencidos
+com `FOR UPDATE SKIP LOCKED`; no processamento financeiro, segue a mesma ordem e
+revalida status e vencimento.
 
-The publisher claims eligible rows in a short transaction with
-`FOR UPDATE SKIP LOCKED`, ordered by event time and ID. It records an instance
-ID and a lease expiration, commits, then sends to `wagering-events.fifo`
-outside the transaction. A successful send is marked published only while the
-row is still locked by that instance. A failed send increments the attempt
-count, records a payload-free error summary, and schedules an exponential
-backoff with jitter, capped at five minutes. Expired leases allow another
-instance to reclaim work after a publisher stops unexpectedly.
+Escolhemos lock pessimista no banco em vez de lock otimista como mecanismo
+principal porque uma wallet quente já sofre contenção esperada. Optimistic
+locking converteria essa contenção em conflitos e retries adicionais,
+complicando idempotência e ampliando trabalho sob carga. A versão da wallet
+permanece como marcador de mudança e verificação auxiliar, não substitui o lock.
+Limitação: operações da mesma wallet são serializadas; a capacidade de uma
+wallet quente é limitada pela duração da transação.
 
-Delivery is at-least-once: a process can stop after SQS accepts a message but
-before the database records it as published. The consumer must deduplicate by
-the envelope's `eventId`; FIFO deduplication uses that same ID, but is not a
-substitute for consumer-side idempotency. `aggregateId` is the FIFO message
-group, so ordering for a wallet is best effort when multiple publishers claim
-rows concurrently. Consumers that require strict per-wallet ordering can use
-the envelope's wallet version to detect and order events.
+Timeout de lock é transitório e vira HTTP `503` com `Retry-After`; o chamador
+pode reenviar com a mesma chave idempotente. A fila FIFO usa `walletId` como
+`MessageGroupId` para reduzir contenção e preservar ordem de recebimento dentro
+do grupo. FIFO é otimização, não garantia final: o banco continua protegendo
+instâncias HTTP, workers e mensagens concorrentes.
 
-## SQS Transaction Consumer
+A wallet nasce com `version = 1`. O crédito interno de `OPENING` representa o
+saldo inicial, mas não incrementa a versão; ela só aumenta quando o saldo muda.
+Uma operação LOSS não muda saldo e não grava novamente a linha da wallet.
 
-The `wager-transactions.fifo` consumer invokes the same
-`SubmitWagerTransactionUseCase` as HTTP. For SQS input, the use case inserts the
-`(consumer_name, message_id)` inbox row, applies the wager, writes the ledger and
-outbox, and sets `processed_at` in one SQL transaction. `message_id` is taken
-from the message envelope, never from SQS's `MessageId`. The HTTP path does not
-provide inbox data and retains its existing behavior.
+## Idempotência e replay
 
-The consumer acknowledges with `DeleteMessage` only after the SQL transaction
-commits. A failed delete is logged and left for safe redelivery through the
-inbox. Same-ID/same-hash redelivery is acknowledged without repeating effects;
-same-ID/different-hash input is permanent.
+A garantia é persistente: constraints únicas no banco protegem chave de
+idempotência e identidade externa do provedor; não há cache em memória como fonte
+de verdade. O `payloadHash` é SHA-256 de JSON canônico (chaves ordenadas) dos
+campos de negócio: provedor, IDs externo/jogador/wallet/rodada/jogo, tipo,
+dinheiro e referência externa. `Idempotency-Key` e metadados de transporte não
+entram no hash.
 
-| Classification | Examples | Action |
-| --- | --- | --- |
-| Business | `REJECTED` with `failureCode`, `PENDING_REFERENCE`, idempotent replay | Commit and delete |
-| Transient | Database/SQS outage, connection or timeout, `lock_timeout`, deadlock, serialization failure | Keep in the main queue and change visibility with exponential backoff |
-| Permanent | Invalid JSON/schema, idempotency conflict, missing wallet, inbox ID with a different payload | Send to `wager-transactions-dlq.fifo` with `errorCode` and `consumerName` attributes, then delete |
+Mesma chave e mesmo hash retornam a transação existente, inclusive o saldo
+observado originalmente e o `failureCode` original. Uma rejeição repetida
+continua HTTP `422`, com `idempotentReplay: true`. Mesma chave com payload
+diferente é conflito `409`, não replay. Para estados sem saldo observado, como
+`PENDING_REFERENCE`, o replay não inventa saldo.
 
-`SQS_MAX_RECEIVES` defaults to 5. A transient failure at or above that receive
-count is also moved to the DLQ, independently of MiniStack redrive behavior.
-`SQS_RETRY_MAX_DELAY_SECONDS` caps the visibility backoff. If sending to the
-DLQ fails, the original message is retained and retried.
+## Referências fora de ordem
 
-FIFO message groups use `walletId`; processing is sequential within each group
-and parallel across groups. A poison message can block later messages for its
-wallet until it is moved to the DLQ, so permanent failures must be removed
-promptly. On `SIGTERM`, the consumer stops receiving, finishes started
-messages, and changes visibility to zero for messages not yet started in the
-received batch. Set `SQS_CONSUMER_ENABLED=true` to start the background
-long-poll loop; `pollOnce()` remains available for controlled processing.
+REFUND/ROLLBACK cuja referência ainda não existe é persistido como
+`PENDING_REFERENCE`. O worker seleciona IDs vencidos com `FOR UPDATE SKIP LOCKED`
+e processa cada candidato em transação própria, com lock wallet → transação.
+Usa backoff exponencial com jitter (base de um segundo e teto de cinco minutos)
+e encerra após oito tentativas ou TTL de 15 minutos. Ao esgotar o limite,
+persiste `REFERENCE_NOT_FOUND` e gera evento na outbox.
 
-## Observability
+O processamento de HTTP, SQS e worker compartilha `ApplyWagerReversalService`
+para validação da referência, alteração de saldo, ledger e eventos. A regra é
+mais rígida que o enunciado: uma transação só pode ser revertida uma vez no
+total, entre REFUND e ROLLBACK. A constraint única parcial do banco também
+impede duas reversões concorrentes.
 
-`GET /health/live` reports process liveness only and does not contact a
-dependency. `GET /health/ready` checks PostgreSQL with `SELECT 1` and the
-`wager-transactions.fifo` queue with `GetQueueAttributes` concurrently; each
-check has a two-second timeout. The ORM connection is lazy so the process can
-start and answer liveness probes when PostgreSQL is unavailable. Both health
-routes are public.
+## Caixa de saída transacional
 
-HTTP requests use `X-Correlation-Id` when supplied or receive a generated ID;
-the response returns that ID. SQS envelopes carry their correlation ID into the
-consumer, application use case, transactional outbox events, publisher, and
-pending-reference worker through `AsyncLocalStorage`. Each JSON log line
-contains a timestamp, level, message, context, and any available
-`correlationId`, `messageId`, `transactionId`, `walletId`, and `providerId`.
-Logs never contain request/message payloads, monetary values, balances, or
-authorization headers.
+Publicar diretamente durante o caso de uso deixaria banco e broker sujeitos a
+falhas independentes. Em vez disso, a transação de wagering grava o envelope em
+`outbox_messages` junto com saldo, transação e ledger. O publicador reclama lotes
+em transação curta com `FOR UPDATE SKIP LOCKED`, define lease, faz commit e envia
+ao SQS fora da transação. No sucesso, marca publicado somente se o lease ainda
+pertence à instância; em falha, registra erro sem payload e agenda backoff.
 
-`GET /metrics` exposes Prometheus text for:
+A entrega ocorre pelo menos uma vez: a instância pode parar após o SQS aceitar a mensagem,
+mas antes de registrar o sucesso no banco. Consumidores devem deduplicar por
+`eventId`. A fila `wagering-events.fifo` usa `aggregateId` como grupo. Com vários
+publishers, a ordem de saída por wallet é melhor esforço; `walletVersion` ajuda
+consumidores a detectar lacunas ou ordenar eventos.
 
-- `wager_transactions_total{status,type,channel}`
-- `idempotency_duplicates_total{channel}`
-- `retries_total{component}` (`consumer`, `outbox`, `pending_reference`)
-- `dlq_messages_total{reason}`
-- `lock_conflicts_total`
-- `reconciliation_divergences_total`
-- `outbox_unpublished_count`, `outbox_lag_seconds`,
-  `pending_reference_count`, and `dlq_queue_depth`
-- `transaction_processing_duration_seconds{channel}` histogram
+## Consumidor SQS e inbox
 
-Counters and histogram observations are held in memory per service instance and
-reset on restart; production Prometheus should scrape and aggregate all
-instances. Outbox and pending-reference gauges are read from PostgreSQL, and DLQ
-depth comes from SQS.
+O consumidor da `wager-transactions.fifo` usa o mesmo caso de uso HTTP. Insere
+`(consumer_name, message_id)` na inbox na mesma transação que aplica a operação,
+grava ledger/outbox e marca a mensagem processada. `DeleteMessage` só ocorre
+depois do commit; redelivery não duplica o efeito.
 
-`POST /wallets/:walletId/reconciliation` reads the wallet balance with
-`SELECT ... FOR SHARE` and sums its append-only ledger in the same SQL
-transaction. The SQL sum remains `BIGINT`/string-backed and is converted to the
-`Money` value object without floating-point arithmetic. A mismatch is returned
-as a divergence, logged at error level, and counted; reconciliation never
-silently corrects a wallet.
+Erros de negócio são confirmados e reconhecidos. Falhas transitórias recebem
+backoff por mudança de visibilidade e, ao exceder `SQS_MAX_RECEIVES`, vão para a
+DLQ. JSON/schema inválidos, conflito de idempotência, wallet inexistente e
+conflito de inbox são permanentes e vão diretamente para a DLQ. Se não for
+possível enviar à DLQ, a mensagem original não é apagada. No shutdown, o
+consumidor termina o trabalho iniciado e libera mensagens ainda não iniciadas.
+
+## HTTP e autenticação
+
+`AuthGuard` é intencionalmente no-op, aplicado aos endpoints de wallet e
+wagering. O ponto de extensão é `src/http/auth.guard.ts`; liveness/readiness
+permanecem públicos, assim como o enunciado determina. Em produção, adotaria um
+provedor de identidade externo OIDC, como Keycloak: validar bearer token, issuer,
+audience, expiração e scopes/roles no guard, e associar o subject autenticado à
+identidade do provedor. Não implementaria armazenamento próprio de senhas neste
+serviço.
+
+## MiniStack
+
+O Compose usa MiniStack para oferecer SQS local sem exigir conta LocalStack para
+desenvolver e testar. As mesmas APIs AWS SDK são usadas em execução local; o
+endpoint é configurado por `SQS_ENDPOINT`. O trade-off é que o emulador local
+pode não reproduzir cada detalhe operacional do SQS gerenciado, portanto
+comportamentos de produção que dependam de diferenças do serviço real precisam
+ser validados separadamente.
+
+## Observabilidade
+
+`/health/live` verifica apenas o processo. `/health/ready` consulta PostgreSQL e
+SQS em paralelo, com timeout individual de dois segundos, e retorna 503 quando
+uma dependência falha. Logs JSON e `X-Correlation-Id` propagam contexto entre
+HTTP, SQS, outbox e worker sem registrar payloads, valores monetários, saldos ou
+headers de autorização.
+
+`/metrics` expõe métricas Prometheus: transações por status/tipo/canal,
+duplicatas, retries, DLQ, conflitos de lock, divergências, latência, estado/lag
+da outbox e referências pendentes. Reconciliação compara saldo da wallet com a
+soma do ledger na mesma transação e não corrige divergências automaticamente.
+
+## Limitações conhecidas e próximos passos
+
+- Contadores e histograma ficam em memória por instância e são reiniciados no
+  restart; a agregação depende do scrape do Prometheus.
+- Com múltiplos publishers, a ordem de eventos de saída por wallet é melhor
+  esforço; o consumidor deve usar `walletVersion` para detectar ordenação.
+- O publicador, consumidor e worker de referências fazem polling; não há
+  coordenação via notificações/eventos do banco.
+- Não há teste de carga nem metas de vazão/latência medidas.
+- `AuthGuard` ainda não valida credenciais; integrar um IdP OIDC é trabalho de
+  produção pendente.
+
+## Uso de IA
+
+Escrevi o código com GitHub Copilot em modo Agent, etapa por etapa, apresentando
+um plano antes de executar cada etapa. As regras fixas de implementação estão
+em `.github/copilot-instructions.md`. Um mentor de IA me explicou conceitos e
+ajudou a escrever os prompts; eu revisei cada etapa e rodei os testes três vezes
+contra PostgreSQL e SQS reais em containers. Registrei os erros encontrados e as
+correções em [docs/ERROS-E-CORRECOES.md](./docs/ERROS-E-CORRECOES.md).

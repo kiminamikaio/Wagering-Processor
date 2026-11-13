@@ -2,143 +2,50 @@
 
 Atualizado em: 2026-11-13
 
-## Etapas concluídas
+## Etapas
 
-A migration inicial `Migration20261112180000` agora inclui os campos de identidade e referência em `wager_transactions`, valida a relação entre tipo/status e os campos de referência/falha, e cria o índice parcial para referências pendentes. O ledger tem índice por `(wallet_id, id)`, CHECK aritmético simplificado e proteção contra `TRUNCATE`, além de `UPDATE` e `DELETE`. `inbox_messages.message_id` é `TEXT` e `payload_hash` é obrigatório.
+| Etapa | Situação | Entrega |
+| --- | --- | --- |
+| 1 | Concluída | Fundação Bun, TypeScript e NestJS. |
+| 2 | Concluída | Infraestrutura local com PostgreSQL e MiniStack/SQS. |
+| 3 | Concluída | Value object `Money` com aritmética exata em centavos. |
+| 4 | Concluída | Migrations, schema, constraints e testes de integração do banco. |
+| 5 | Concluída | Domínio de wallet, transação, ledger e transições válidas. |
+| 6A | Concluída | Persistência transacional, repositories, lock pessimista e hash canônico. |
+| 6B | Concluída | Casos de uso de wallet e wagering, eventos, ledger e outbox atômicos. |
+| 7 | Concluída | REFUND/ROLLBACK, referências fora de ordem e worker de pendências. |
+| 8 | Concluída | API HTTP, validação, idempotência e mapa de status. |
+| 9 | Concluída | Concorrência por wallet, 50 replays e testes com três instâncias. |
+| 10 | Concluída | Publicador SQS com transactional outbox, lease e recuperação. |
+| 11 | Concluída | Consumidor SQS com inbox, retries, DLQ e shutdown. |
+| 12 | Concluída | Worker de referências pendentes e resolução/rejeição por política. |
+| 13 | Concluída | Health, logs JSON, métricas e reconciliação. |
+| 14 | Concluída | Documentação final, erros registrados, README e arquitetura revisados. |
 
-O teste de integração verifica as novas constraints de campos obrigatórios, referência externa de REFUND/ROLLBACK e `failure_code` de acordo com status; também verifica o hash obrigatório da inbox, `message_id` textual, tentativas padrão, índices e trigger contra `TRUNCATE`.
+## Validação final da etapa 14
 
-### Etapa 5 — domínio puro
+- `bun test` — **150 testes aprovados**, sem falhas (PostgreSQL e MiniStack reais em containers).
+- `bun run typecheck` — sucesso (`tsc --noEmit`, exit code 0).
 
-Implementados em `src/wagering/domain/`:
+O conjunto cobre unidade, schema/persistência, casos de uso, HTTP, concorrência,
+multi-instância, consumidor/outbox, DLQ, worker de referências, reinício e
+shutdown. Não há teste de carga.
 
-- `WalletLedgerEntry`: entidade imutável; `create` verifica valor positivo, aritmética e saldo após lançamento; `rehydrate` reconstrói estado.
-- `Wallet`: aggregate root com `open` e `rehydrate`; débito/crédito retornam lançamento, atualizam saldo e incrementam versão somente quando o saldo muda. IDs e horários são recebidos por parâmetro.
-- `WagerTransaction`: enums de tipo/status, criação pública em `PENDING`, factory interna de `OPENING`, reidratação sem validar histórico de transições, transições permitidas, consultas e direção do ledger.
-- `FailureCode` e erros de domínio tipados em arquivo próprio.
-- Testes unitários co-localizados; sem dependência de NestJS, MikroORM ou banco no domínio.
+## Histórico relevante da validação
 
-### Etapa 6A — persistência
+Na execução de migrations `down` seguida de `up`, uma fixture de teste
+`PROCESSED` permaneceu sem `observed_balance`, removido pelo `down`. A fixture
+foi revertida para `PENDING` antes do `up`. Os testes de persistência passaram a
+usar IDs aleatórios para não colidir entre execuções. O episódio está detalhado
+em [ERROS-E-CORRECOES.md](./ERROS-E-CORRECOES.md).
 
-- Nova migration `Migration20261112200000` adiciona `observed_balance_cents` com checks para não-negatividade e obrigatoriedade em transações `PROCESSED`/`REJECTED`; a migration anterior não foi alterada.
-- Portas `WageringUnitOfWork`, `WageringTx` e repositórios de wallet, transação, ledger e outbox em `src/wagering/application/ports/`.
-- Adaptadores MikroORM usam `EntityManager.transactional()` e SQL parametrizado; wallet usa `SELECT ... FOR UPDATE` e controle otimista de versão; o ledger só expõe `insert`.
-- Mapeamento de centavos centralizado: leitura de `BIGINT` como string seguida de `BigInt`, sem conversão monetária para `number`.
-- `computePayloadHash` gera SHA-256 de JSON canônico dos campos de negócio especificados, sem idempotency key nem metadados.
-- Testes cobrem schema, round-trips de persistência, concorrência de versão, append-only do ledger, conversão monetária e canonicalização do hash.
-- Nenhum use case ou endpoint foi adicionado nesta etapa.
+As validações históricas registradas nas etapas 9 a 13 foram executadas três
+vezes cada; na etapa 13, cada rodada informou 150 testes aprovados, zero falhas e
+2150 assertions, incluindo PostgreSQL e MiniStack reais. A etapa 14 repete a
+validação completa uma vez.
 
-### Etapa 6B — casos de uso
+## Documentação
 
-- Adicionados os ports `Clock` e `IdGenerator`, com `SystemClock` e implementação `BunIdGenerator` usando UUIDv7. O Unit of Work agora cria um `EntityManager` forkado por execução.
-- A busca idempotente retorna a transação e o saldo originalmente observado, usando a moeda da wallet mesmo em rejeições por divergência de moeda.
-- Implementados os erros de aplicação, `PLAYER_MISMATCH` e os eventos de integração tipados, serializados como envelope JSON com valores monetários em `MoneyProps`.
-- `SubmitWagerTransactionUseCase` processa BET/WIN/LOSS, persiste rejeições, aplica replay idempotente, grava ledger e outbox atomicamente; REFUND/ROLLBACK/OPENING são rejeitados antes de abrir a transação.
-- `CreateWalletUseCase` cria wallets com ou sem saldo inicial; saldo positivo grava OPENING, ledger CREDIT e eventos na mesma transação.
-- Testes PostgreSQL cobrem processamento, replay e conflito, rejeições, eventos, criação de wallet e duas apostas simultâneas disputando o mesmo saldo. Ainda não foram adicionados controllers ou módulos NestJS.
-- Transações `PENDING_REFERENCE` podem não ter `observed_balance`; a etapa 7 implementa o replay sem saldo observado, permitindo resposta HTTP `202` sem saldo.
-
-### Etapa 7 — REFUND, ROLLBACK e referências pendentes
-
-- `REFUND` e `ROLLBACK` são processados após o lock da wallet, resolvendo a referência por provider e ID externo dentro da mesma transação; a etapa 12 extraiu a aplicação do estorno para uso compartilhado com o worker.
-- Referência ausente gera `PENDING_REFERENCE` e evento de outbox, sem saldo/ledger observado; replay preserva o saldo ausente. Estornos válidos gravam `reference_transaction_id` e ledger atômico, com `REFUND` como crédito e `ROLLBACK` na direção inversa.
-- Validações persistem rejeições com `REFERENCE_MISMATCH`, `INVALID_REFERENCE_KIND`, `AMOUNT_MISMATCH`, `ALREADY_REVERSED` ou `REVERSAL_WOULD_OVERDRAW`.
-- Decisão: cada transação referenciada pode ter no máximo um estorno processado no total, seja `REFUND` ou `ROLLBACK`; migration ajusta o índice único parcial como segunda proteção contra concorrência.
-- Testes PostgreSQL cobrem REFUND de BET, ROLLBACK de WIN, referência fora de ordem, rejeições de referência/valor, overdraw e corrida REFUND/ROLLBACK sobre a mesma BET. O worker da etapa 12 não foi criado.
-
-### Etapa 8 — API HTTP NestJS
-
-- `AppModule` registra controllers, casos de uso, `MikroORM`, Unit of Work, relógio, gerador de IDs e repositório de consultas. `AuthGuard` no-op protege wallet e wagering; health segue público. A decisão de autenticação futura está em `ARCHITECTURE.md`.
-- Implementados `POST /wallets`, `GET /wallets/:walletId`, `GET /wallets/:walletId/ledger`, `POST /wagering/transactions`, `GET /wagering/transactions/:transactionId` e a consulta por provider/ID externo. Cursor do ledger é base64 da sequência monotônica; limit padrão 50 e máximo 100.
-- `Idempotency-Key` é obrigatório; campos monetários HTTP exigem strings decimais com duas casas. Um exception filter global padroniza erros como `{ error: { code, message } }`.
-- Mapa HTTP: processamento e replay `200`; wallet criada `201`; `PENDING_REFERENCE` `202` sem saldo; payload inválido `400`; recurso ausente `404`; conflito de idempotência e wallet duplicada `409`; rejeição `422` com `failureCode`; falha transitória do banco `503` com `Retry-After`.
-- Migration adiciona sequência identity ao ledger e índice de consulta por wallet/sequência. E2E usa NestJS real, `app.listen(0)`, `fetch` e PostgreSQL, cobrindo criação/duplicidade, BET/replay/conflito, rejeição sem saldo, referência pendente, validação, 404 e paginação.
-
-### Etapa 9 — concorrência HTTP e multi-instância
-
-- Configurados o pool PostgreSQL por `DB_POOL_MAX` (padrão 10) e o `lock_timeout` local por `DB_LOCK_TIMEOUT_MS` (padrão 5000 ms); timeout de lock mantém resposta transitória HTTP `503` com `Retry-After`.
-- `main.ts` já aceitava `PORT` com padrão 3000; preservada a implementação existente.
-- Adicionado helper compartilhado de teste que compara saldo com o ledger, valida continuidade dos saldos por `seq` e exige `wallet.version == 1 + lançamentos não-OPENING` (o crédito `OPENING` inicial não incrementa a versão).
-- `src/concurrency.e2e.test.ts` cobre concorrência HTTP real, replay, payload divergente, mistura BET/WIN, wallets independentes, estornos concorrentes e referência pendente.
-- `src/multi-instance.e2e.test.ts` sobe três processos reais com Bun e distribui as requisições entre eles; cada cenário verifica banco, outbox e invariantes do ledger.
-- Respostas HTTP `422` incluem `idempotentReplay`, permitindo distinguir a rejeição original do replay; no replay, o corpo é idêntico ao original exceto pelo campo `idempotentReplay` agora verdadeiro.
-
-### Etapa 10 — publicador da Transactional Outbox
-
-- Adicionado `@aws-sdk/client-sqs` e configuração por ambiente para endpoint, região, credenciais e URL da fila FIFO `wagering-events.fifo`; o `sqs-init` cria a fila com deduplicação por conteúdo desativada.
-- A migration reversível `Migration20261113170000` adiciona `locked_by`, `locked_until` e `last_error` à outbox sem alterar migrations anteriores.
-- `SqsOutboxPublisher` reivindica linhas com `FOR UPDATE SKIP LOCKED` em transação curta, publica fora da transação e marca o sucesso somente se o lease ainda pertencer à instância. Falhas registram resumo sem payload, incrementam tentativas e usam backoff exponencial com jitter (máximo de cinco minutos).
-- O publisher roda em loop por padrão, configurável por variáveis `OUTBOX_PUBLISHER_*`; `main.ts` habilita hooks de shutdown para concluir o lote ativo. Relógio, ID da instância e sender são substituíveis nos testes.
-- Testes de integração com PostgreSQL e MiniStack cobrem envelope e commit atômico, concorrência entre publishers, lease, reenvio após falha, retry, tipos de evento e reinício de instância.
-- A entrega é at-least-once: consumidores devem deduplicar por `eventId`. A ordem por wallet com vários publishers é melhor esforço; consumidores que exigem ordenação podem usar a versão do wallet.
-
-### Etapa 11 — consumidor SQS, inbox e DLQ
-
-- `SubmitWagerTransactionUseCase` recebe uma opção `inbox` para entradas SQS; a inbox, o efeito financeiro, ledger, outbox e `processed_at` são gravados na mesma transação. HTTP continua sem inbox. Duplicata com hash igual não repete o efeito; o mesmo `messageId` com payload diferente é permanente.
-- Adicionado consumidor FIFO com o parser/validação HTTP, usando `messageId` do envelope, ordem serial por `MessageGroupId` e paralelismo entre wallets. `DeleteMessage` ocorre somente depois do commit.
-- Erros de negócio são confirmados e reconhecidos; transitórios recebem backoff exponencial e vão para a DLQ ao atingir `SQS_MAX_RECEIVES` (padrão 5); JSON/schema inválidos, conflito de idempotência, wallet inexistente e conflito da inbox vão diretamente para `wager-transactions-dlq.fifo`.
-- `SQS_CONSUMER_ENABLED` controla o loop; shutdown interrompe o polling, termina o trabalho iniciado e libera mensagens ainda não iniciadas. Adicionado `bun run sqs:send` para enviar uma aposta de demonstração a uma wallet existente.
-- Testes de integração PostgreSQL/MiniStack reais cobrem BET, duplicatas, integração HTTP, falha entre commit e ack, rejeição de negócio, validação/DLQ, conflitos, retry/MAX_RECEIVES, 50 mensagens em cinco wallets, shutdown, e ROLLBACK pendente; os cenários verificam consistência do ledger.
-
-### Etapa 12 — worker de referências pendentes
-
-- Extraída a aplicação de REFUND/ROLLBACK para `ApplyWagerReversalService`, compartilhado pelo caso de uso HTTP/SQS e pelo worker: validações de referência, aplicação do ledger/saldo e eventos Processed/Rejected/WalletBalanceChanged continuam atômicos na outbox.
-- `PENDING_REFERENCE` começa com `reference_attempts = 0`, primeira tentativa em 1 segundo e um único `WagerTransactionPendingReference`. O worker seleciona IDs vencidos em lote com `FOR UPDATE SKIP LOCKED`; cada processamento usa transação própria e lock wallet → transação, rechecando status e vencimento.
-- Referência ausente usa backoff exponencial com jitter (base 1 s, teto 5 min); rejeita com `REFERENCE_NOT_FOUND`, sem ledger, ao atingir 8 tentativas ou TTL de 15 min desde `created_at`. Configuração por `REFERENCE_MAX_ATTEMPTS`, `REFERENCE_TTL` (ms) e `PENDING_REFERENCE_WORKER_ENABLED`.
-- Worker integrado ao ciclo de vida NestJS, `runOnce()` manual, `Clock` substituível e shutdown aguardando o lote. Não foi necessária migration: campos e índice parcial já existiam.
-- Testes PostgreSQL cobrem resolução e replay HTTP, tentativa/TTL, vencimento, mismatch de valor/rodada, overdraw, duas reversões para a mesma referência, concorrência de dois workers em 20 pendências, concorrência com 20 BETs HTTP e referência resolvida após BET via SQS; os cenários verificam o ledger.
-
-### Etapa 13 — health, observabilidade e reconciliação
-
-- `GET /health/live` segue independente de infraestrutura; `GET /health/ready` testa PostgreSQL e `wager-transactions.fifo` em paralelo, com timeout individual de dois segundos e diagnóstico por dependência. Ambos permanecem públicos.
-- Adicionado logger JSON como `LoggerService`, middleware HTTP para gerar/propagar `X-Correlation-Id` e contexto `AsyncLocalStorage` também no consumidor SQS, publisher e worker. Os eventos de outbox mantêm a correlação recebida no envelope.
-- Logs de transações processadas/rejeitadas/pendentes, duplicatas, retries, DLQ, lock timeout, falha de publish e divergência usam campos permitidos e não serializam payload, dados financeiros, saldo ou headers de autenticação.
-- `/metrics` expõe contadores e histograma em registry em memória por instância; gauges de outbox, referências pendentes e DLQ são consultados no banco/SQS durante cada scrape. A agregação de produção deve ser feita pelo Prometheus.
-- Adicionada reconciliação protegida por AuthGuard; o saldo e a soma BIGINT do ledger são lidos na mesma transação com `SELECT ... FOR SHARE`. Divergências são sinalizadas, logadas e contabilizadas, sem correção automática.
-- Testes adicionados para readiness com dependência SQS indisponível, reconciliação após operações, divergência sem correção, propagação de correlação, métricas e filtragem de campos sensíveis nos logs.
-
-## Validação executada
-
-Sequência de migrations:
-
-1. `bun run migration:down` — sucesso.
-2. `bun run migration:up` — sucesso.
-
-Ao reexecutar `up` após `down`, uma fixture de teste `PROCESSED` ficou sem o valor observado removido pelo `down`; a fixture local foi revertida para `PENDING` e `up` concluiu. Como o Unit of Work agora usa um fork com transação própria, os testes de persistência usam identificadores aleatórios e não dependem de rollback externo.
-
-Validação após a etapa 6B:
-
-1. `bun test` — 87 pass, 0 fail (369 assertions), com PostgreSQL real.
-2. `bun run typecheck` — sucesso (`tsc --noEmit`, exit code 0).
-
-Foram lidas as seções 6, 7, 8 e 11 de `DESAFIO.md` e as regras de `.github/copilot-instructions.md` antes da implementação da etapa 6B.
-
-Validação da etapa 8:
-
-1. `bun test` — 101 testes, 0 falhas, com PostgreSQL real.
-2. `bun run typecheck` — sucesso (`tsc --noEmit`, exit code 0).
-
-Validação da etapa 9:
-
-1. `bun test` — três execuções consecutivas: cada uma com 110 testes aprovados e 0 falhas (1046 assertions).
-2. `bun run typecheck` — sucesso (`tsc --noEmit`, exit code 0).
-
-Validação da etapa 10:
-
-1. `bun test` — três execuções consecutivas: cada uma com 118 testes aprovados e 0 falhas.
-2. `bun run typecheck` — sucesso (`tsc --noEmit`, exit code 0).
-
-Validação da etapa 11:
-
-1. `bun test` — três execuções consecutivas: cada uma com 131 testes aprovados e 0 falhas, incluindo PostgreSQL e MiniStack reais.
-2. `bun run typecheck` — sucesso (`tsc --noEmit`, exit code 0).
-
-Validação da etapa 12:
-
-1. `bun test` — três execuções consecutivas: cada uma com 141 testes aprovados, 0 falhas e 1952 assertions, incluindo PostgreSQL e MiniStack reais.
-2. `bun run typecheck` — sucesso (`tsc --noEmit`, exit code 0).
-
-Validação da etapa 13:
-
-1. `bun test` — três execuções consecutivas: cada uma com 150 testes aprovados, 0 falhas e 2150 assertions, incluindo PostgreSQL e MiniStack reais.
-2. `bun run typecheck` — sucesso (`tsc --noEmit`, exit code 0).
+- [Erros e correções](./ERROS-E-CORRECOES.md)
+- [Decisões de arquitetura](../ARCHITECTURE.md)
+- [Enunciado do desafio](./DESAFIO.md)
