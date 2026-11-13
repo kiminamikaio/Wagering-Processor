@@ -21,6 +21,13 @@ export class IdempotencyConflictError extends Error {
   }
 }
 
+export class InboxMessageConflictError extends Error {
+  constructor(consumerName: string, messageId: string) {
+    super(`Inbox message ${consumerName}/${messageId} has a different payload.`);
+    this.name = "InboxMessageConflictError";
+  }
+}
+
 export class WalletAlreadyExistsError extends Error {
   constructor(playerId: string, currency: string) {
     super(`A ${currency} wallet already exists for player ${playerId}.`);

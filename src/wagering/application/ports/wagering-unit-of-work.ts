@@ -20,6 +20,7 @@ export interface WageringTx {
   transactions: WagerTransactionRepository;
   ledger: LedgerRepository;
   outbox: OutboxRepository;
+  inbox: InboxRepository;
 }
 
 export interface ExistingWagerTransaction {
@@ -64,4 +65,16 @@ export interface EnqueueOutboxMessage {
 
 export interface OutboxRepository {
   enqueue(message: EnqueueOutboxMessage): Promise<void>;
+}
+
+export interface InboxMessageInput {
+  consumerName: string;
+  messageId: string;
+  payloadHash: string;
+  payload: Readonly<Record<string, unknown>>;
+}
+
+export interface InboxRepository {
+  insertIfAbsent(message: InboxMessageInput): Promise<boolean>;
+  markProcessed(consumerName: string, messageId: string): Promise<void>;
 }

@@ -24,8 +24,13 @@ import {
   outboxPublisherOptionsFromEnvironment,
   SqsOutboxPublisher,
 } from "./wagering/infrastructure/outbox/sqs-outbox-publisher";
+import {
+  SqsTransactionConsumer,
+  sqsTransactionConsumerOptionsFromEnvironment,
+} from "./wagering/infrastructure/consumer/sqs-transaction-consumer";
 
 const SQS_CLIENT = Symbol("SQS_CLIENT");
+const SQS_CONSUMER_CLIENT = Symbol("SQS_CONSUMER_CLIENT");
 
 @Injectable()
 class MikroOrmLifecycle implements OnApplicationShutdown {
@@ -53,6 +58,10 @@ class MikroOrmLifecycle implements OnApplicationShutdown {
       useFactory: createOutboxSqsClient,
     },
     {
+      provide: SQS_CONSUMER_CLIENT,
+      useFactory: createOutboxSqsClient,
+    },
+    {
       provide: SqsOutboxPublisher,
       useFactory: (
         orm: MikroORM,
@@ -68,6 +77,20 @@ class MikroOrmLifecycle implements OnApplicationShutdown {
           true,
         ),
       inject: [MikroORM, SQS_CLIENT, CLOCK],
+    },
+    {
+      provide: SqsTransactionConsumer,
+      useFactory: (
+        submitWager: SubmitWagerTransactionUseCase,
+        client: ReturnType<typeof createOutboxSqsClient>,
+      ) =>
+        new SqsTransactionConsumer(
+          submitWager,
+          client,
+          sqsTransactionConsumerOptionsFromEnvironment(),
+          true,
+        ),
+      inject: [SubmitWagerTransactionUseCase, SQS_CONSUMER_CLIENT],
     },
     MikroOrmLifecycle,
     {

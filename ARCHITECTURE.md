@@ -58,3 +58,36 @@ substitute for consumer-side idempotency. `aggregateId` is the FIFO message
 group, so ordering for a wallet is best effort when multiple publishers claim
 rows concurrently. Consumers that require strict per-wallet ordering can use
 the envelope's wallet version to detect and order events.
+
+## SQS Transaction Consumer
+
+The `wager-transactions.fifo` consumer invokes the same
+`SubmitWagerTransactionUseCase` as HTTP. For SQS input, the use case inserts the
+`(consumer_name, message_id)` inbox row, applies the wager, writes the ledger and
+outbox, and sets `processed_at` in one SQL transaction. `message_id` is taken
+from the message envelope, never from SQS's `MessageId`. The HTTP path does not
+provide inbox data and retains its existing behavior.
+
+The consumer acknowledges with `DeleteMessage` only after the SQL transaction
+commits. A failed delete is logged and left for safe redelivery through the
+inbox. Same-ID/same-hash redelivery is acknowledged without repeating effects;
+same-ID/different-hash input is permanent.
+
+| Classification | Examples | Action |
+| --- | --- | --- |
+| Business | `REJECTED` with `failureCode`, `PENDING_REFERENCE`, idempotent replay | Commit and delete |
+| Transient | Database/SQS outage, connection or timeout, `lock_timeout`, deadlock, serialization failure | Keep in the main queue and change visibility with exponential backoff |
+| Permanent | Invalid JSON/schema, idempotency conflict, missing wallet, inbox ID with a different payload | Send to `wager-transactions-dlq.fifo` with `errorCode` and `consumerName` attributes, then delete |
+
+`SQS_MAX_RECEIVES` defaults to 5. A transient failure at or above that receive
+count is also moved to the DLQ, independently of MiniStack redrive behavior.
+`SQS_RETRY_MAX_DELAY_SECONDS` caps the visibility backoff. If sending to the
+DLQ fails, the original message is retained and retried.
+
+FIFO message groups use `walletId`; processing is sequential within each group
+and parallel across groups. A poison message can block later messages for its
+wallet until it is moved to the DLQ, so permanent failures must be removed
+promptly. On `SIGTERM`, the consumer stops receiving, finishes started
+messages, and changes visibility to zero for messages not yet started in the
+received batch. Set `SQS_CONSUMER_ENABLED=true` to start the background
+long-poll loop; `pollOnce()` remains available for controlled processing.

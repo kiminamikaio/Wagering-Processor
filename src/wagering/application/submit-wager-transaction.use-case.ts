@@ -30,6 +30,7 @@ import {
 import {
   Clock,
   IdGenerator,
+  InboxMessageInput,
   WageringUnitOfWork,
 } from "./ports/wagering-unit-of-work";
 import { WagerTransactionReferenceResolver } from "./wager-transaction-reference-resolver";
@@ -46,6 +47,7 @@ export interface SubmitWagerTransactionInput {
   money: MoneyProps;
   referenceExternalTransactionId?: string;
   correlationId?: string;
+  inbox?: InboxMessageInput;
 }
 
 export interface SubmitWagerTransactionOutput {
@@ -54,6 +56,7 @@ export interface SubmitWagerTransactionOutput {
   balance?: MoneyProps;
   idempotentReplay: boolean;
   failureCode?: FailureCode;
+  inboxDuplicate?: boolean;
 }
 
 function processedEvent(
@@ -137,6 +140,45 @@ export class SubmitWagerTransactionUseCase {
     const payloadHash = computePayloadHash(input);
 
     return this.unitOfWork.run(async (tx) => {
+      if (input.inbox !== undefined) {
+        const inserted = await tx.inbox.insertIfAbsent(input.inbox);
+        if (!inserted) {
+          const existing = await tx.transactions.findByIdempotencyKeyOrExternalId(
+            input.providerId,
+            input.externalTransactionId,
+            input.idempotencyKey,
+          );
+          if (existing === undefined) {
+            throw new Error("A processed inbox message has no wager transaction.");
+          }
+          return {
+            transactionId: existing.transaction.id,
+            status: existing.transaction.status,
+            idempotentReplay: true,
+            inboxDuplicate: true,
+            ...(existing.observedBalance === undefined
+              ? {}
+              : { balance: existing.observedBalance.toJSON() }),
+            ...(existing.transaction.failureCode === undefined
+              ? {}
+              : { failureCode: existing.transaction.failureCode }),
+          };
+        }
+      }
+
+      const complete = async (
+        result: SubmitWagerTransactionOutput,
+      ): Promise<SubmitWagerTransactionOutput> => {
+        if (input.inbox === undefined) {
+          return result;
+        }
+        await tx.inbox.markProcessed(
+          input.inbox.consumerName,
+          input.inbox.messageId,
+        );
+        return { ...result, inboxDuplicate: false };
+      };
+
       const wallet = await tx.wallets.findByIdForUpdate(input.walletId);
       if (wallet === undefined) {
         throw new WalletNotFoundError(input.walletId);
@@ -155,7 +197,7 @@ export class SubmitWagerTransactionUseCase {
           throw new IdempotencyConflictError(input.idempotencyKey);
         }
 
-        return {
+        return complete({
           transactionId: existing.transaction.id,
           status: existing.transaction.status,
           idempotentReplay: true,
@@ -165,7 +207,7 @@ export class SubmitWagerTransactionUseCase {
           ...(existing.transaction.failureCode === undefined
             ? {}
             : { failureCode: existing.transaction.failureCode }),
-        };
+        });
       }
 
       const createdAt = this.clock.now();
@@ -228,11 +270,11 @@ export class SubmitWagerTransactionUseCase {
             }),
           );
 
-          return {
+          return complete({
             transactionId: transaction.id,
             status: transaction.status,
             idempotentReplay: false,
-          };
+          });
         }
 
         if (
@@ -352,13 +394,13 @@ export class SubmitWagerTransactionUseCase {
           ),
         );
 
-        return {
+        return complete({
           transactionId: transaction.id,
           status: transaction.status,
           balance: wallet.balance.toJSON(),
           idempotentReplay: false,
           failureCode: transaction.failureCode,
-        };
+        });
       }
 
       if (ledgerEntry !== undefined) {
@@ -403,12 +445,12 @@ export class SubmitWagerTransactionUseCase {
         );
       }
 
-      return {
+      return complete({
         transactionId: transaction.id,
         status: transaction.status,
         balance: wallet.balance.toJSON(),
         idempotentReplay: false,
-      };
+      });
     });
   }
 }

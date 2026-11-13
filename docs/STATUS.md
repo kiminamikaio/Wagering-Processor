@@ -72,6 +72,14 @@ Implementados em `src/wagering/domain/`:
 - Testes de integração com PostgreSQL e MiniStack cobrem envelope e commit atômico, concorrência entre publishers, lease, reenvio após falha, retry, tipos de evento e reinício de instância.
 - A entrega é at-least-once: consumidores devem deduplicar por `eventId`. A ordem por wallet com vários publishers é melhor esforço; consumidores que exigem ordenação podem usar a versão do wallet.
 
+### Etapa 11 — consumidor SQS, inbox e DLQ
+
+- `SubmitWagerTransactionUseCase` recebe uma opção `inbox` para entradas SQS; a inbox, o efeito financeiro, ledger, outbox e `processed_at` são gravados na mesma transação. HTTP continua sem inbox. Duplicata com hash igual não repete o efeito; o mesmo `messageId` com payload diferente é permanente.
+- Adicionado consumidor FIFO com o parser/validação HTTP, usando `messageId` do envelope, ordem serial por `MessageGroupId` e paralelismo entre wallets. `DeleteMessage` ocorre somente depois do commit.
+- Erros de negócio são confirmados e reconhecidos; transitórios recebem backoff exponencial e vão para a DLQ ao atingir `SQS_MAX_RECEIVES` (padrão 5); JSON/schema inválidos, conflito de idempotência, wallet inexistente e conflito da inbox vão diretamente para `wager-transactions-dlq.fifo`.
+- `SQS_CONSUMER_ENABLED` controla o loop; shutdown interrompe o polling, termina o trabalho iniciado e libera mensagens ainda não iniciadas. Adicionado `bun run sqs:send` para enviar uma aposta de demonstração a uma wallet existente.
+- Testes de integração PostgreSQL/MiniStack reais cobrem BET, duplicatas, integração HTTP, falha entre commit e ack, rejeição de negócio, validação/DLQ, conflitos, retry/MAX_RECEIVES, 50 mensagens em cinco wallets, shutdown, e ROLLBACK pendente; os cenários verificam consistência do ledger.
+
 ## Validação executada
 
 Sequência de migrations:
@@ -101,4 +109,9 @@ Validação da etapa 9:
 Validação da etapa 10:
 
 1. `bun test` — três execuções consecutivas: cada uma com 118 testes aprovados e 0 falhas.
+2. `bun run typecheck` — sucesso (`tsc --noEmit`, exit code 0).
+
+Validação da etapa 11:
+
+1. `bun test` — três execuções consecutivas: cada uma com 131 testes aprovados e 0 falhas, incluindo PostgreSQL e MiniStack reais.
 2. `bun run typecheck` — sucesso (`tsc --noEmit`, exit code 0).

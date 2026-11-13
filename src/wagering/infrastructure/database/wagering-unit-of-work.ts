@@ -7,6 +7,7 @@ import { MikroOrmLedgerRepository } from "./ledger-repository";
 import { MikroOrmOutboxRepository } from "./outbox-repository";
 import { MikroOrmWalletRepository } from "./wallet-repository";
 import { MikroOrmWagerTransactionRepository } from "./wager-transaction-repository";
+import { MikroOrmInboxRepository } from "./inbox-repository";
 
 function lockTimeoutMilliseconds(): number {
   const rawValue = process.env.DB_LOCK_TIMEOUT_MS;
@@ -27,12 +28,14 @@ class MikroOrmWageringTx implements WageringTx {
   readonly transactions: MikroOrmWagerTransactionRepository;
   readonly ledger: MikroOrmLedgerRepository;
   readonly outbox: MikroOrmOutboxRepository;
+  readonly inbox: MikroOrmInboxRepository;
 
   constructor(em: EntityManager) {
     this.wallets = new MikroOrmWalletRepository(em);
     this.transactions = new MikroOrmWagerTransactionRepository(em);
     this.ledger = new MikroOrmLedgerRepository(em);
     this.outbox = new MikroOrmOutboxRepository(em);
+    this.inbox = new MikroOrmInboxRepository(em);
   }
 }
 

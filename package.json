@@ -6,6 +6,7 @@
   "scripts": {
     "start:dev": "bun --watch src/main.ts",
     "start": "bun src/main.ts",
+    "sqs:send": "bun scripts/sqs-send.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "infra:up": "docker compose up -d",
