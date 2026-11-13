@@ -33,6 +33,38 @@ on the same wallet while retaining parallelism across wallets. SQS FIFO ordering
 by wallet is a useful optimization that can reduce lock contention, but the
 database constraints and wallet lock remain the final correctness guarantee.
 
+## Out-of-order references
+
+A `REFUND` or `ROLLBACK` whose reference has not arrived is committed as
+`PENDING_REFERENCE` with `reference_attempts = 0` and its first retry scheduled
+one second later. `WagerTransactionPendingReference` is written to the outbox
+only at this transition, never on a retry.
+
+The worker claims due transaction IDs in batches using
+`FOR UPDATE SKIP LOCKED`, then commits that short claim transaction. Each
+candidate is handled in its own SQL transaction: it locks the wallet first,
+then the pending wager transaction, and rechecks both its status and due time.
+The lock order matches the HTTP/SQS use case and prevents a stale batch claim
+from causing a duplicate attempt or a reversal after another worker resolved it.
+
+Missing references use exponential backoff with jitter, starting at one second
+and capped at five minutes. Processing stops at the first of eight unsuccessful
+attempts (`REFERENCE_MAX_ATTEMPTS`) or 15 minutes after `created_at`
+(`REFERENCE_TTL`, milliseconds). Eight attempts allow rapid retries while
+bounding database work; the 15-minute TTL gives a delayed provider event time to
+arrive without leaving stale transactions pending indefinitely. Both limits
+are configurable. When either limit is reached, the transaction is rejected
+with `REFERENCE_NOT_FOUND`, without a ledger entry, and
+`WagerTransactionRejected` is added to the same transaction's outbox.
+
+When the reference exists, the worker and request use case call the same
+application service for reference validation, balance changes, ledger writes,
+and processed/rejected outbox events. The database permits at most one
+processed reversal in total for a referenced transaction, whether the reversal
+is a `REFUND` or `ROLLBACK`. Set `PENDING_REFERENCE_WORKER_ENABLED=true` to
+start the loop; `runOnce()` remains available for controlled execution. Shutdown
+waits for the active batch to finish.
+
 ## Transactional Outbox
 
 The application does not publish an integration event directly while handling

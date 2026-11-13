@@ -40,7 +40,7 @@ Implementados em `src/wagering/domain/`:
 
 ### Etapa 7 — REFUND, ROLLBACK e referências pendentes
 
-- `REFUND` e `ROLLBACK` agora são processados após o lock da wallet, resolvendo a referência por provider e ID externo dentro da mesma transação; a lógica de resolução ficou reutilizável para o worker futuro.
+- `REFUND` e `ROLLBACK` são processados após o lock da wallet, resolvendo a referência por provider e ID externo dentro da mesma transação; a etapa 12 extraiu a aplicação do estorno para uso compartilhado com o worker.
 - Referência ausente gera `PENDING_REFERENCE` e evento de outbox, sem saldo/ledger observado; replay preserva o saldo ausente. Estornos válidos gravam `reference_transaction_id` e ledger atômico, com `REFUND` como crédito e `ROLLBACK` na direção inversa.
 - Validações persistem rejeições com `REFERENCE_MISMATCH`, `INVALID_REFERENCE_KIND`, `AMOUNT_MISMATCH`, `ALREADY_REVERSED` ou `REVERSAL_WOULD_OVERDRAW`.
 - Decisão: cada transação referenciada pode ter no máximo um estorno processado no total, seja `REFUND` ou `ROLLBACK`; migration ajusta o índice único parcial como segunda proteção contra concorrência.
@@ -80,6 +80,14 @@ Implementados em `src/wagering/domain/`:
 - `SQS_CONSUMER_ENABLED` controla o loop; shutdown interrompe o polling, termina o trabalho iniciado e libera mensagens ainda não iniciadas. Adicionado `bun run sqs:send` para enviar uma aposta de demonstração a uma wallet existente.
 - Testes de integração PostgreSQL/MiniStack reais cobrem BET, duplicatas, integração HTTP, falha entre commit e ack, rejeição de negócio, validação/DLQ, conflitos, retry/MAX_RECEIVES, 50 mensagens em cinco wallets, shutdown, e ROLLBACK pendente; os cenários verificam consistência do ledger.
 
+### Etapa 12 — worker de referências pendentes
+
+- Extraída a aplicação de REFUND/ROLLBACK para `ApplyWagerReversalService`, compartilhado pelo caso de uso HTTP/SQS e pelo worker: validações de referência, aplicação do ledger/saldo e eventos Processed/Rejected/WalletBalanceChanged continuam atômicos na outbox.
+- `PENDING_REFERENCE` começa com `reference_attempts = 0`, primeira tentativa em 1 segundo e um único `WagerTransactionPendingReference`. O worker seleciona IDs vencidos em lote com `FOR UPDATE SKIP LOCKED`; cada processamento usa transação própria e lock wallet → transação, rechecando status e vencimento.
+- Referência ausente usa backoff exponencial com jitter (base 1 s, teto 5 min); rejeita com `REFERENCE_NOT_FOUND`, sem ledger, ao atingir 8 tentativas ou TTL de 15 min desde `created_at`. Configuração por `REFERENCE_MAX_ATTEMPTS`, `REFERENCE_TTL` (ms) e `PENDING_REFERENCE_WORKER_ENABLED`.
+- Worker integrado ao ciclo de vida NestJS, `runOnce()` manual, `Clock` substituível e shutdown aguardando o lote. Não foi necessária migration: campos e índice parcial já existiam.
+- Testes PostgreSQL cobrem resolução e replay HTTP, tentativa/TTL, vencimento, mismatch de valor/rodada, overdraw, duas reversões para a mesma referência, concorrência de dois workers em 20 pendências, concorrência com 20 BETs HTTP e referência resolvida após BET via SQS; os cenários verificam o ledger.
+
 ## Validação executada
 
 Sequência de migrations:
@@ -114,4 +122,9 @@ Validação da etapa 10:
 Validação da etapa 11:
 
 1. `bun test` — três execuções consecutivas: cada uma com 131 testes aprovados e 0 falhas, incluindo PostgreSQL e MiniStack reais.
+2. `bun run typecheck` — sucesso (`tsc --noEmit`, exit code 0).
+
+Validação da etapa 12:
+
+1. `bun test` — três execuções consecutivas: cada uma com 141 testes aprovados, 0 falhas e 1952 assertions, incluindo PostgreSQL e MiniStack reais.
 2. `bun run typecheck` — sucesso (`tsc --noEmit`, exit code 0).

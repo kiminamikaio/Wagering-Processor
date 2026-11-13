@@ -64,6 +64,8 @@ export interface CreateWagerTransactionProps {
 export interface WagerTransactionState extends CreateWagerTransactionProps {
   status: WagerTransactionStatus;
   referenceTransactionId?: string;
+  referenceAttempts?: number;
+  referenceNextAttemptAt?: Date;
   failureCode?: FailureCode;
   processedAt?: Date;
 }
@@ -84,6 +86,8 @@ export class WagerTransaction {
   private readonly createdAtMilliseconds: number;
   private _status: WagerTransactionStatus;
   private _referenceTransactionId: string | undefined;
+  private _referenceAttempts: number;
+  private _referenceNextAttemptAtMilliseconds: number | undefined;
   private _failureCode: FailureCode | undefined;
   private _processedAtMilliseconds: number | undefined;
 
@@ -103,6 +107,9 @@ export class WagerTransaction {
     this.createdAtMilliseconds = state.createdAt.getTime();
     this._status = state.status;
     this._referenceTransactionId = state.referenceTransactionId;
+    this._referenceAttempts = state.referenceAttempts ?? 0;
+    this._referenceNextAttemptAtMilliseconds =
+      state.referenceNextAttemptAt?.getTime();
     this._failureCode = state.failureCode;
     this._processedAtMilliseconds = state.processedAt?.getTime();
   }
@@ -142,6 +149,16 @@ export class WagerTransaction {
     return this._referenceTransactionId;
   }
 
+  get referenceAttempts(): number {
+    return this._referenceAttempts;
+  }
+
+  get referenceNextAttemptAt(): Date | undefined {
+    return this._referenceNextAttemptAtMilliseconds === undefined
+      ? undefined
+      : new Date(this._referenceNextAttemptAtMilliseconds);
+  }
+
   get failureCode(): FailureCode | undefined {
     return this._failureCode;
   }
@@ -167,7 +184,7 @@ export class WagerTransaction {
     this._processedAtMilliseconds = at.getTime();
   }
 
-  markPendingReference(): void {
+  markPendingReference(nextAttemptAt?: Date): void {
     this.assertTransition(WagerTransactionStatus.PENDING_REFERENCE);
     if (!this.requiresReference()) {
       throw new InvalidTransactionStateError(
@@ -177,6 +194,23 @@ export class WagerTransaction {
     }
 
     this._status = WagerTransactionStatus.PENDING_REFERENCE;
+    this._referenceAttempts = 0;
+    this._referenceNextAttemptAtMilliseconds = nextAttemptAt?.getTime();
+  }
+
+  recordReferenceAttempt(attempts: number, nextAttemptAt?: Date): void {
+    if (this._status !== WagerTransactionStatus.PENDING_REFERENCE) {
+      throw new InvalidTransactionStateError(
+        this._status,
+        WagerTransactionStatus.PENDING_REFERENCE,
+      );
+    }
+    if (!Number.isSafeInteger(attempts) || attempts < 0) {
+      throw new RangeError("Reference attempts must be a non-negative integer.");
+    }
+
+    this._referenceAttempts = attempts;
+    this._referenceNextAttemptAtMilliseconds = nextAttemptAt?.getTime();
   }
 
   reject(code: FailureCode): void {

@@ -64,6 +64,40 @@ export class MikroOrmWagerTransactionRepository
     };
   }
 
+  async findDueReferenceIds(now: Date, limit: number, providerId?: string) {
+    const providerFilter =
+      providerId === undefined ? "" : "AND provider_id = ?";
+    const params =
+      providerId === undefined ? [now, limit] : [now, providerId, limit];
+    const rows = await executeRows(
+      this.em,
+      `SELECT id::text AS id, wallet_id::text AS wallet_id
+       FROM wager_transactions
+       WHERE status = 'PENDING_REFERENCE'
+         AND reference_next_attempt_at <= ?
+         ${providerFilter}
+       ORDER BY reference_next_attempt_at, created_at, id
+       LIMIT ?
+       FOR UPDATE SKIP LOCKED`,
+      params,
+    );
+
+    return rows.map((row) => ({
+      id: requiredString(row, "id"),
+      walletId: requiredString(row, "wallet_id"),
+    }));
+  }
+
+  async findByIdForUpdate(id: string): Promise<WagerTransaction | undefined> {
+    const rows = await executeRows(
+      this.em,
+      "SELECT * FROM wager_transactions WHERE id = ? FOR UPDATE",
+      [id],
+    );
+
+    return rows[0] === undefined ? undefined : wagerTransactionFromRow(rows[0]);
+  }
+
   async findReferenceForUpdate(
     providerId: string,
     externalTransactionId: string,
@@ -104,8 +138,9 @@ export class MikroOrmWagerTransactionRepository
         id, wallet_id, player_id, round_id, game_id, provider_id,
         external_transaction_id, idempotency_key, payload_hash, kind, status,
         amount_cents, currency, reference_transaction_id,
-        reference_external_transaction_id, failure_code, created_at, processed_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        reference_external_transaction_id, failure_code, reference_attempts,
+        reference_next_attempt_at, created_at, processed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         transaction.id,
         transaction.walletId,
@@ -123,6 +158,8 @@ export class MikroOrmWagerTransactionRepository
         transaction.referenceTransactionId ?? null,
         transaction.referenceExternalTransactionId ?? null,
         transaction.failureCode ?? null,
+        transaction.referenceAttempts,
+        transaction.referenceNextAttemptAt?.toISOString() ?? null,
         transaction.createdAt.toISOString(),
         transaction.processedAt?.toISOString() ?? null,
       ],
@@ -137,7 +174,8 @@ export class MikroOrmWagerTransactionRepository
       this.em,
       `UPDATE wager_transactions
        SET status = ?, failure_code = ?, processed_at = ?,
-           reference_transaction_id = ?, observed_balance_cents = ?
+           reference_transaction_id = ?, observed_balance_cents = ?,
+           reference_attempts = ?, reference_next_attempt_at = ?
        WHERE id = ?`,
       [
         transaction.status,
@@ -145,6 +183,8 @@ export class MikroOrmWagerTransactionRepository
         transaction.processedAt?.toISOString() ?? null,
         transaction.referenceTransactionId ?? null,
         observedBalance === undefined ? null : moneyToCents(observedBalance),
+        transaction.referenceAttempts,
+        transaction.referenceNextAttemptAt?.toISOString() ?? null,
         transaction.id,
       ],
     );

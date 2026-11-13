@@ -91,6 +91,8 @@ export function wagerTransactionFromRow(row: SqlRow): WagerTransaction {
     createdAt: requiredDate(row, "created_at"),
     status,
     referenceTransactionId,
+    referenceAttempts: requiredInteger(row, "reference_attempts"),
+    referenceNextAttemptAt: optionalDate(row, "reference_next_attempt_at"),
     failureCode,
     processedAt,
   });

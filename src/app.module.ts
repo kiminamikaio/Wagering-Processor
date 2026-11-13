@@ -28,6 +28,10 @@ import {
   SqsTransactionConsumer,
   sqsTransactionConsumerOptionsFromEnvironment,
 } from "./wagering/infrastructure/consumer/sqs-transaction-consumer";
+import {
+  PendingReferenceWorker,
+  pendingReferenceWorkerOptionsFromEnvironment,
+} from "./wagering/infrastructure/reference/pending-reference-worker";
 
 const SQS_CLIENT = Symbol("SQS_CLIENT");
 const SQS_CONSUMER_CLIENT = Symbol("SQS_CONSUMER_CLIENT");
@@ -91,6 +95,21 @@ class MikroOrmLifecycle implements OnApplicationShutdown {
           true,
         ),
       inject: [SubmitWagerTransactionUseCase, SQS_CONSUMER_CLIENT],
+    },
+    {
+      provide: PendingReferenceWorker,
+      useFactory: (
+        unitOfWork: WageringUnitOfWork,
+        clock: Clock,
+        ids: IdGenerator,
+      ) =>
+        new PendingReferenceWorker(
+          unitOfWork,
+          clock,
+          ids,
+          pendingReferenceWorkerOptionsFromEnvironment(),
+        ),
+      inject: [WAGERING_UNIT_OF_WORK, CLOCK, ID_GENERATOR],
     },
     MikroOrmLifecycle,
     {

@@ -22,8 +22,11 @@ import { assertWalletMatchesLedger } from "../../../test-support/assert-wallet-m
 import { CreateWalletUseCase } from "../../application/create-wallet.use-case";
 import { SubmitWagerTransactionInput } from "../../application/submit-wager-transaction.use-case";
 import { SubmitWagerTransactionUseCase } from "../../application/submit-wager-transaction.use-case";
-import { WageringUnitOfWork } from "../../application/ports/wagering-unit-of-work";
-import { WagerTransactionKind } from "../../domain/wager-transaction";
+import { Clock, WageringUnitOfWork } from "../../application/ports/wagering-unit-of-work";
+import {
+  WagerTransactionKind,
+  WagerTransactionStatus,
+} from "../../domain/wager-transaction";
 import { executeRows, requiredString } from "../database/sql";
 import { MikroOrmWageringUnitOfWork } from "../database/wagering-unit-of-work";
 import {
@@ -37,6 +40,7 @@ import {
   SubmitWagerExecutor,
   sqsTransactionConsumerOptionsFromEnvironment,
 } from "./sqs-transaction-consumer";
+import { PendingReferenceWorker } from "../reference/pending-reference-worker";
 
 process.env.SQS_CONSUMER_ENABLED = "false";
 
@@ -59,7 +63,28 @@ let dlqUrl: string;
 let unitOfWork: MikroOrmWageringUnitOfWork;
 let createWalletUseCase: CreateWalletUseCase;
 let submitWagerUseCase: SubmitWagerTransactionUseCase;
+let clock: MutableClock;
 const consumerName = "sqs-transaction-consumer-integration";
+
+class MutableClock implements Clock {
+  private current: Date;
+
+  constructor(now: Date) {
+    this.current = now;
+  }
+
+  now(): Date {
+    return new Date(this.current.getTime());
+  }
+
+  advance(milliseconds: number): void {
+    this.current = new Date(this.current.getTime() + milliseconds);
+  }
+
+  set(now: Date): void {
+    this.current = new Date(now.getTime());
+  }
+}
 
 function consumer(
   submitWager: SubmitWagerExecutor = submitWagerUseCase,
@@ -222,7 +247,7 @@ describe("SQS transaction consumer with PostgreSQL and MiniStack", () => {
     orm = await MikroORM.init(mikroOrmConfig);
     await orm.getMigrator().up();
     unitOfWork = new MikroOrmWageringUnitOfWork(orm.em);
-    const clock = new SystemClock();
+    clock = new MutableClock(new SystemClock().now());
     const ids = new BunIdGenerator();
     createWalletUseCase = new CreateWalletUseCase(unitOfWork, clock, ids);
     submitWagerUseCase = new SubmitWagerTransactionUseCase(unitOfWork, clock, ids);
@@ -241,6 +266,7 @@ describe("SQS transaction consumer with PostgreSQL and MiniStack", () => {
   });
 
   beforeEach(async () => {
+    clock.set(new Date());
     await drainQueue(queueUrl);
     await drainQueue(dlqUrl);
   });
@@ -623,6 +649,53 @@ describe("SQS transaction consumer with PostgreSQL and MiniStack", () => {
     )).toBe(1);
     expect(await inboxRow(message.messageId)).toBeDefined();
     expect(await readDlq()).toHaveLength(0);
+    await assertWalletMatchesLedger(orm.em, wallet.id);
+  });
+
+  it("resolves a pending REFUND after its BET arrives through SQS", async () => {
+    const wallet = await createWallet();
+    const referenceExternalTransactionId = `sqs-reference-${Bun.randomUUIDv7()}`;
+    const refund = wagerInput(wallet, {
+      kind: WagerTransactionKind.REFUND,
+      referenceExternalTransactionId,
+    });
+    const pending = await submitWagerUseCase.execute(refund);
+    expect(pending.status).toBe(WagerTransactionStatus.PENDING_REFERENCE);
+
+    clock.advance(1_000);
+    const bet = wagerInput(wallet, {
+      externalTransactionId: referenceExternalTransactionId,
+      kind: WagerTransactionKind.BET,
+      roundId: refund.roundId,
+      money: refund.money,
+    });
+    const message = envelope(bet);
+    await sendEnvelope(message);
+    await consumer().pollOnce();
+    expect(await inboxRow(message.messageId)).toBeDefined();
+
+    const worker = new PendingReferenceWorker(
+      unitOfWork,
+      clock,
+      new BunIdGenerator(),
+      {
+        batchSize: 100,
+        intervalMs: 1_000,
+        baseDelayMs: 1_000,
+        maxAttempts: 8,
+        ttlMs: 900_000,
+        enabled: false,
+      },
+    );
+    expect((await worker.runOnce("provider-sqs-test")).resolved).toBe(1);
+    expect(
+      await countRows(
+        `SELECT COUNT(*)::text AS count
+         FROM wallet_ledger_entries
+         WHERE transaction_id = ? AND direction = 'CREDIT'`,
+        [pending.transactionId],
+      ),
+    ).toBe(1);
     await assertWalletMatchesLedger(orm.em, wallet.id);
   });
 });

@@ -35,6 +35,12 @@ export interface WalletRepository {
 }
 
 export interface WagerTransactionRepository {
+  findDueReferenceIds(
+    now: Date,
+    limit: number,
+    providerId?: string,
+  ): Promise<DueReferenceCandidate[]>;
+  findByIdForUpdate(id: string): Promise<WagerTransaction | undefined>;
   findByIdempotencyKeyOrExternalId(
     providerId: string,
     externalTransactionId: string,
@@ -50,6 +56,11 @@ export interface WagerTransactionRepository {
     transaction: WagerTransaction,
     observedBalance: Money | undefined,
   ): Promise<void>;
+}
+
+export interface DueReferenceCandidate {
+  id: string;
+  walletId: string;
 }
 
 export interface LedgerRepository {
