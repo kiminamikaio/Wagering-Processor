@@ -24,7 +24,7 @@ export interface WageringTx {
 
 export interface ExistingWagerTransaction {
   transaction: WagerTransaction;
-  observedBalance: Money;
+  observedBalance: Money | undefined;
 }
 
 export interface WalletRepository {
@@ -39,8 +39,16 @@ export interface WagerTransactionRepository {
     externalTransactionId: string,
     idempotencyKey: string,
   ): Promise<ExistingWagerTransaction | undefined>;
+  findReferenceForUpdate(
+    providerId: string,
+    externalTransactionId: string,
+  ): Promise<WagerTransaction | undefined>;
+  hasProcessedReversal(referenceTransactionId: string): Promise<boolean>;
   insert(transaction: WagerTransaction): Promise<void>;
-  save(transaction: WagerTransaction, observedBalance: Money): Promise<void>;
+  save(
+    transaction: WagerTransaction,
+    observedBalance: Money | undefined,
+  ): Promise<void>;
 }
 
 export interface LedgerRepository {

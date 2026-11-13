@@ -154,7 +154,7 @@ describe("MikroORM wagering persistence", () => {
       expect(byIdempotency?.transaction.roundId).toBe("round/free-form");
       expect(byIdempotency?.transaction.gameId).toBe("game/free-form");
       expect(byExternalId?.transaction.id).toBe(transaction.id);
-      expect(byIdempotency?.observedBalance.toString()).toBe("0.90");
+      expect(byIdempotency?.observedBalance?.toString()).toBe("0.90");
 
       const saved = await tx.transactions.findByIdempotencyKeyOrExternalId(
         transaction.providerId,
@@ -164,7 +164,7 @@ describe("MikroORM wagering persistence", () => {
       expect(saved?.transaction.status).toBe(WagerTransactionStatus.PROCESSED);
       expect(saved?.transaction.processedAt).toEqual(later);
       expect(saved?.transaction.failureCode).toBeUndefined();
-      expect(saved?.observedBalance.toString()).toBe("0.90");
+      expect(saved?.observedBalance?.toString()).toBe("0.90");
     });
   });
 

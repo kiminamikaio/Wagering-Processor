@@ -293,9 +293,9 @@ describe("PostgreSQL schema constraints", () => {
     });
   });
 
-  it("allows only one processed refund or rollback per reference and kind", async () => {
+  it("allows only one processed refund or rollback per reference", async () => {
     await expectConstraintFailure(
-      "wager_transactions_processed_reference_kind_unique",
+      "wager_transactions_processed_reference_unique",
       async (em) => {
         const walletId = await insertWallet(em);
         const referenceId = await insertWager(em, {
@@ -306,7 +306,7 @@ describe("PostgreSQL schema constraints", () => {
         });
         await insertWager(em, {
           walletId,
-          kind: "REFUND",
+          kind: "ROLLBACK",
           status: "PROCESSED",
           referenceTransactionId: referenceId,
           referenceExternalTransactionId: "provider-reference",

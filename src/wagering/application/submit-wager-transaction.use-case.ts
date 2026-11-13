@@ -11,6 +11,7 @@ import {
   WagerTransactionStatus,
 } from "../domain/wager-transaction";
 import { Wallet } from "../domain/wallet";
+import { LedgerDirection } from "../domain/wallet-ledger-entry";
 import { computePayloadHash } from "./compute-payload-hash";
 import {
   IdempotencyConflictError,
@@ -21,6 +22,7 @@ import {
 import {
   MoneyProps,
   WagerTransactionProcessed,
+  WagerTransactionPendingReference,
   WagerTransactionRejected,
   WalletBalanceChanged,
   enqueueIntegrationEvent,
@@ -30,6 +32,7 @@ import {
   IdGenerator,
   WageringUnitOfWork,
 } from "./ports/wagering-unit-of-work";
+import { WagerTransactionReferenceResolver } from "./wager-transaction-reference-resolver";
 
 export interface SubmitWagerTransactionInput {
   providerId: string;
@@ -48,7 +51,7 @@ export interface SubmitWagerTransactionInput {
 export interface SubmitWagerTransactionOutput {
   transactionId: string;
   status: WagerTransactionStatus;
-  balance: MoneyProps;
+  balance?: MoneyProps;
   idempotentReplay: boolean;
   failureCode?: FailureCode;
 }
@@ -109,6 +112,8 @@ function rejectedEvent(
 }
 
 export class SubmitWagerTransactionUseCase {
+  private readonly referenceResolver = new WagerTransactionReferenceResolver();
+
   constructor(
     private readonly unitOfWork: WageringUnitOfWork,
     private readonly clock: Clock,
@@ -121,7 +126,9 @@ export class SubmitWagerTransactionUseCase {
     if (
       input.kind !== WagerTransactionKind.BET &&
       input.kind !== WagerTransactionKind.WIN &&
-      input.kind !== WagerTransactionKind.LOSS
+      input.kind !== WagerTransactionKind.LOSS &&
+      input.kind !== WagerTransactionKind.REFUND &&
+      input.kind !== WagerTransactionKind.ROLLBACK
     ) {
       throw new UnsupportedTransactionKindError(input.kind);
     }
@@ -151,8 +158,10 @@ export class SubmitWagerTransactionUseCase {
         return {
           transactionId: existing.transaction.id,
           status: existing.transaction.status,
-          balance: existing.observedBalance.toJSON(),
           idempotentReplay: true,
+          ...(existing.observedBalance === undefined
+            ? {}
+            : { balance: existing.observedBalance.toJSON() }),
           ...(existing.transaction.failureCode === undefined
             ? {}
             : { failureCode: existing.transaction.failureCode }),
@@ -185,7 +194,73 @@ export class SubmitWagerTransactionUseCase {
         throw error;
       }
 
-      if (input.playerId !== wallet.playerId) {
+      let reference: WagerTransaction | undefined;
+      if (transaction.requiresReference()) {
+        const referenceExternalTransactionId =
+          transaction.referenceExternalTransactionId;
+        if (referenceExternalTransactionId === undefined) {
+          throw new Error("A reversal must have a reference external transaction ID.");
+        }
+
+        reference = await this.referenceResolver.resolve(
+          tx,
+          transaction.providerId,
+          referenceExternalTransactionId,
+        );
+        if (reference === undefined) {
+          transaction.markPendingReference();
+          await tx.transactions.save(transaction, undefined);
+          await enqueueIntegrationEvent(
+            tx,
+            new WagerTransactionPendingReference({
+              eventId: this.idGenerator.next(),
+              aggregateId: transaction.walletId,
+              correlationId: input.correlationId ?? transaction.id,
+              occurredAt: createdAt,
+              data: {
+                transactionId: transaction.id,
+                providerId: transaction.providerId,
+                externalTransactionId: transaction.externalTransactionId,
+                playerId: transaction.playerId,
+                walletId: transaction.walletId,
+                referenceExternalTransactionId,
+              },
+            }),
+          );
+
+          return {
+            transactionId: transaction.id,
+            status: transaction.status,
+            idempotentReplay: false,
+          };
+        }
+
+        if (
+          reference.providerId !== transaction.providerId ||
+          reference.playerId !== transaction.playerId ||
+          reference.playerId !== wallet.playerId ||
+          reference.walletId !== transaction.walletId ||
+          reference.walletId !== wallet.id ||
+          reference.money.currency !== money.currency ||
+          wallet.currency !== money.currency ||
+          reference.roundId !== transaction.roundId ||
+          reference.status !== WagerTransactionStatus.PROCESSED
+        ) {
+          transaction.reject(FailureCode.REFERENCE_MISMATCH);
+        } else if (
+          transaction.kind === WagerTransactionKind.REFUND
+            ? reference.kind !== WagerTransactionKind.BET
+            : reference.kind !== WagerTransactionKind.BET &&
+              reference.kind !== WagerTransactionKind.WIN &&
+              reference.kind !== WagerTransactionKind.REFUND
+        ) {
+          transaction.reject(FailureCode.INVALID_REFERENCE_KIND);
+        } else if (!reference.money.equals(money)) {
+          transaction.reject(FailureCode.AMOUNT_MISMATCH);
+        } else if (await tx.transactions.hasProcessedReversal(reference.id)) {
+          transaction.reject(FailureCode.ALREADY_REVERSED);
+        }
+      } else if (input.playerId !== wallet.playerId) {
         transaction.reject(FailureCode.PLAYER_MISMATCH);
       } else if (input.money.currency !== wallet.currency) {
         transaction.reject(FailureCode.CURRENCY_MISMATCH);
@@ -216,12 +291,45 @@ export class SubmitWagerTransactionUseCase {
               break;
             case WagerTransactionKind.LOSS:
               break;
+            case WagerTransactionKind.REFUND:
+              ledgerEntry = wallet.credit(
+                money,
+                transaction.id,
+                this.idGenerator.next(),
+                createdAt,
+              );
+              break;
+            case WagerTransactionKind.ROLLBACK: {
+              if (reference === undefined) {
+                throw new Error("A rollback must have a resolved reference.");
+              }
+              const direction = transaction.ledgerDirectionFor(reference);
+              ledgerEntry =
+                direction === LedgerDirection.CREDIT
+                  ? wallet.credit(
+                      money,
+                      transaction.id,
+                      this.idGenerator.next(),
+                      createdAt,
+                    )
+                  : wallet.debit(
+                      money,
+                      transaction.id,
+                      this.idGenerator.next(),
+                      createdAt,
+                    );
+              break;
+            }
             default:
               throw new UnsupportedTransactionKindError(transaction.kind);
           }
         } catch (error) {
           if (error instanceof InsufficientBalanceError) {
-            transaction.reject(FailureCode.INSUFFICIENT_FUNDS);
+            transaction.reject(
+              transaction.requiresReference()
+                ? FailureCode.REVERSAL_WOULD_OVERDRAW
+                : FailureCode.INSUFFICIENT_FUNDS,
+            );
           } else if (error instanceof CurrencyMismatchError) {
             transaction.reject(FailureCode.CURRENCY_MISMATCH);
           } else {
@@ -257,7 +365,7 @@ export class SubmitWagerTransactionUseCase {
         await tx.ledger.insert(ledgerEntry);
         await tx.wallets.save(wallet, versionBefore);
       }
-      transaction.markProcessed(undefined, createdAt);
+      transaction.markProcessed(reference?.id, createdAt);
       await tx.transactions.save(transaction, wallet.balance);
       await enqueueIntegrationEvent(
         tx,

@@ -5,7 +5,12 @@ import { WagerTransaction } from "../../domain/wager-transaction";
 import { moneyFromCents, moneyToCents } from "./money-mapper";
 import { PersistenceMappingError } from "./persistence-errors";
 import { wagerTransactionFromRow } from "./row-mappers";
-import { executeRows, executeStatement, requiredString } from "./sql";
+import {
+  executeRows,
+  executeStatement,
+  optionalString,
+  requiredString,
+} from "./sql";
 
 export class MikroOrmWagerTransactionRepository
   implements WagerTransactionRepository
@@ -42,13 +47,54 @@ export class MikroOrmWagerTransactionRepository
       return undefined;
     }
 
+    const observedBalanceCents = optionalString(
+      rows[0],
+      "observed_balance_cents",
+    );
+
     return {
       transaction: wagerTransactionFromRow(rows[0]),
-      observedBalance: moneyFromCents(
-        requiredString(rows[0], "observed_balance_cents"),
-        requiredString(rows[0], "observed_balance_currency"),
-      ),
+      observedBalance:
+        observedBalanceCents === undefined
+          ? undefined
+          : moneyFromCents(
+              observedBalanceCents,
+              requiredString(rows[0], "observed_balance_currency"),
+            ),
     };
+  }
+
+  async findReferenceForUpdate(
+    providerId: string,
+    externalTransactionId: string,
+  ): Promise<WagerTransaction | undefined> {
+    const rows = await executeRows(
+      this.em,
+      `SELECT *
+       FROM wager_transactions
+       WHERE provider_id = ? AND external_transaction_id = ?
+       FOR UPDATE`,
+      [providerId, externalTransactionId],
+    );
+
+    return rows[0] === undefined
+      ? undefined
+      : wagerTransactionFromRow(rows[0]);
+  }
+
+  async hasProcessedReversal(referenceTransactionId: string): Promise<boolean> {
+    const rows = await executeRows(
+      this.em,
+      `SELECT id
+       FROM wager_transactions
+       WHERE reference_transaction_id = ?
+         AND status = 'PROCESSED'
+         AND kind IN ('REFUND', 'ROLLBACK')
+       LIMIT 1`,
+      [referenceTransactionId],
+    );
+
+    return rows.length > 0;
   }
 
   async insert(transaction: WagerTransaction): Promise<void> {
@@ -83,7 +129,10 @@ export class MikroOrmWagerTransactionRepository
     );
   }
 
-  async save(transaction: WagerTransaction, observedBalance: Money): Promise<void> {
+  async save(
+    transaction: WagerTransaction,
+    observedBalance: Money | undefined,
+  ): Promise<void> {
     await executeStatement(
       this.em,
       `UPDATE wager_transactions
@@ -95,7 +144,7 @@ export class MikroOrmWagerTransactionRepository
         transaction.failureCode ?? null,
         transaction.processedAt?.toISOString() ?? null,
         transaction.referenceTransactionId ?? null,
-        moneyToCents(observedBalance),
+        observedBalance === undefined ? null : moneyToCents(observedBalance),
         transaction.id,
       ],
     );

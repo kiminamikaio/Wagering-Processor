@@ -695,15 +695,14 @@
         },
         {
           "columnNames": [
-            "reference_transaction_id",
-            "kind"
+            "reference_transaction_id"
           ],
-          "composite": true,
+          "composite": false,
           "constraint": false,
-          "keyName": "wager_transactions_processed_reference_kind_unique",
+          "keyName": "wager_transactions_processed_reference_unique",
           "unique": true,
           "primary": false,
-          "expression": "CREATE UNIQUE INDEX wager_transactions_processed_reference_kind_unique ON public.wager_transactions USING btree (reference_transaction_id, kind) WHERE ((status = 'PROCESSED'::text) AND (kind = ANY (ARRAY['REFUND'::text, 'ROLLBACK'::text])))"
+          "expression": "CREATE UNIQUE INDEX wager_transactions_processed_reference_unique ON public.wager_transactions USING btree (reference_transaction_id) WHERE ((status = 'PROCESSED'::text) AND (kind = ANY (ARRAY['REFUND'::text, 'ROLLBACK'::text])))"
         },
         {
           "columnNames": [

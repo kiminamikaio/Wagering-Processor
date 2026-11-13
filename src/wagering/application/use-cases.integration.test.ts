@@ -311,6 +311,263 @@ describe("wagering application use cases", () => {
     await assertWalletMatchesLedger(wallet.id);
   });
 
+  it("processes a REFUND of a BET as a credit", async () => {
+    const wallet = await createWallet.execute({
+      playerId: Bun.randomUUIDv7(),
+      initialBalance: { amount: "100.00", currency: "BRL" },
+    });
+    const betInput = createRequest(wallet, {
+      money: { amount: "25.00", currency: "BRL" },
+    });
+    const bet = await submitWager.execute(betInput);
+    const refundInput = createRequest(wallet, {
+      kind: WagerTransactionKind.REFUND,
+      referenceExternalTransactionId: betInput.externalTransactionId,
+      money: { amount: "25.00", currency: "BRL" },
+    });
+
+    const refund = await submitWager.execute(refundInput);
+
+    expect(refund.status).toBe(WagerTransactionStatus.PROCESSED);
+    expect(refund.balance).toEqual({ amount: "100.00", currency: "BRL" });
+    expect(await ledgerCount(refund.transactionId, "CREDIT")).toBe(1);
+    expect((await readTransaction(refundInput))?.transaction.referenceTransactionId)
+      .toBe(bet.transactionId);
+    await assertWalletMatchesLedger(wallet.id);
+  });
+
+  it("processes a ROLLBACK of a WIN as a debit", async () => {
+    const wallet = await createWallet.execute({
+      playerId: Bun.randomUUIDv7(),
+      initialBalance: { amount: "10.00", currency: "BRL" },
+    });
+    const winInput = createRequest(wallet, {
+      kind: WagerTransactionKind.WIN,
+      money: { amount: "5.00", currency: "BRL" },
+    });
+    const win = await submitWager.execute(winInput);
+    const rollbackInput = createRequest(wallet, {
+      kind: WagerTransactionKind.ROLLBACK,
+      referenceExternalTransactionId: winInput.externalTransactionId,
+      money: { amount: "5.00", currency: "BRL" },
+    });
+
+    const rollback = await submitWager.execute(rollbackInput);
+
+    expect(rollback.status).toBe(WagerTransactionStatus.PROCESSED);
+    expect(rollback.balance).toEqual({ amount: "10.00", currency: "BRL" });
+    expect(await ledgerCount(rollback.transactionId, "DEBIT")).toBe(1);
+    expect((await readTransaction(rollbackInput))?.transaction.referenceTransactionId)
+      .toBe(win.transactionId);
+    await assertWalletMatchesLedger(wallet.id);
+  });
+
+  it("persists a reversal with a missing reference as PENDING_REFERENCE", async () => {
+    const wallet = await createWallet.execute({
+      playerId: Bun.randomUUIDv7(),
+      initialBalance: { amount: "0.00", currency: "BRL" },
+    });
+    const input = createRequest(wallet, {
+      kind: WagerTransactionKind.REFUND,
+      referenceExternalTransactionId: "reference-arrives-later",
+    });
+
+    const result = await submitWager.execute(input);
+    const persisted = await readTransaction(input);
+
+    expect(result.status).toBe(WagerTransactionStatus.PENDING_REFERENCE);
+    expect(result).not.toHaveProperty("balance");
+    expect(persisted?.observedBalance).toBeUndefined();
+    expect(await ledgerCount(result.transactionId)).toBe(0);
+    expect((await readEvents(wallet.id, result.transactionId)).map((row) => row.event_type))
+      .toEqual(["WagerTransactionPendingReference"]);
+    expect(await submitWager.execute(input)).toEqual({
+      transactionId: result.transactionId,
+      status: WagerTransactionStatus.PENDING_REFERENCE,
+      idempotentReplay: true,
+    });
+    await assertWalletMatchesLedger(wallet.id);
+  });
+
+  it("rejects a second reversal of the same reference as ALREADY_REVERSED", async () => {
+    const wallet = await createWallet.execute({
+      playerId: Bun.randomUUIDv7(),
+      initialBalance: { amount: "10.00", currency: "BRL" },
+    });
+    const betInput = createRequest(wallet, {
+      money: { amount: "1.00", currency: "BRL" },
+    });
+    await submitWager.execute(betInput);
+    await submitWager.execute(
+      createRequest(wallet, {
+        kind: WagerTransactionKind.REFUND,
+        referenceExternalTransactionId: betInput.externalTransactionId,
+        money: { amount: "1.00", currency: "BRL" },
+      }),
+    );
+
+    const second = await submitWager.execute(
+      createRequest(wallet, {
+        kind: WagerTransactionKind.ROLLBACK,
+        referenceExternalTransactionId: betInput.externalTransactionId,
+        money: { amount: "1.00", currency: "BRL" },
+      }),
+    );
+
+    expect(second.status).toBe(WagerTransactionStatus.REJECTED);
+    expect(second.failureCode).toBe(FailureCode.ALREADY_REVERSED);
+    expect(await ledgerCount(second.transactionId)).toBe(0);
+    await assertWalletMatchesLedger(wallet.id);
+  });
+
+  it("rejects REFUND of a WIN as INVALID_REFERENCE_KIND", async () => {
+    const wallet = await createWallet.execute({
+      playerId: Bun.randomUUIDv7(),
+      initialBalance: { amount: "0.00", currency: "BRL" },
+    });
+    const winInput = createRequest(wallet, {
+      kind: WagerTransactionKind.WIN,
+      money: { amount: "1.00", currency: "BRL" },
+    });
+    await submitWager.execute(winInput);
+
+    const refund = await submitWager.execute(
+      createRequest(wallet, {
+        kind: WagerTransactionKind.REFUND,
+        referenceExternalTransactionId: winInput.externalTransactionId,
+        money: { amount: "1.00", currency: "BRL" },
+      }),
+    );
+
+    expect(refund.status).toBe(WagerTransactionStatus.REJECTED);
+    expect(refund.failureCode).toBe(FailureCode.INVALID_REFERENCE_KIND);
+    expect(await ledgerCount(refund.transactionId)).toBe(0);
+    await assertWalletMatchesLedger(wallet.id);
+  });
+
+  it("rejects a reversal with a different amount as AMOUNT_MISMATCH", async () => {
+    const wallet = await createWallet.execute({
+      playerId: Bun.randomUUIDv7(),
+      initialBalance: { amount: "10.00", currency: "BRL" },
+    });
+    const betInput = createRequest(wallet, {
+      money: { amount: "1.00", currency: "BRL" },
+    });
+    await submitWager.execute(betInput);
+
+    const refund = await submitWager.execute(
+      createRequest(wallet, {
+        kind: WagerTransactionKind.REFUND,
+        referenceExternalTransactionId: betInput.externalTransactionId,
+        money: { amount: "2.00", currency: "BRL" },
+      }),
+    );
+
+    expect(refund.status).toBe(WagerTransactionStatus.REJECTED);
+    expect(refund.failureCode).toBe(FailureCode.AMOUNT_MISMATCH);
+    expect(await ledgerCount(refund.transactionId)).toBe(0);
+    await assertWalletMatchesLedger(wallet.id);
+  });
+
+  it("rejects a reversal with a mismatched reference identity", async () => {
+    const wallet = await createWallet.execute({
+      playerId: Bun.randomUUIDv7(),
+      initialBalance: { amount: "10.00", currency: "BRL" },
+    });
+    const betInput = createRequest(wallet, {
+      money: { amount: "1.00", currency: "BRL" },
+    });
+    await submitWager.execute(betInput);
+
+    const refund = await submitWager.execute(
+      createRequest(wallet, {
+        kind: WagerTransactionKind.REFUND,
+        playerId: Bun.randomUUIDv7(),
+        referenceExternalTransactionId: betInput.externalTransactionId,
+        money: { amount: "1.00", currency: "BRL" },
+      }),
+    );
+
+    expect(refund.status).toBe(WagerTransactionStatus.REJECTED);
+    expect(refund.failureCode).toBe(FailureCode.REFERENCE_MISMATCH);
+    expect(await ledgerCount(refund.transactionId)).toBe(0);
+    await assertWalletMatchesLedger(wallet.id);
+  });
+
+  it("rejects a ROLLBACK of a spent WIN as REVERSAL_WOULD_OVERDRAW", async () => {
+    const wallet = await createWallet.execute({
+      playerId: Bun.randomUUIDv7(),
+      initialBalance: { amount: "0.00", currency: "BRL" },
+    });
+    const winInput = createRequest(wallet, {
+      kind: WagerTransactionKind.WIN,
+      money: { amount: "5.00", currency: "BRL" },
+    });
+    await submitWager.execute(winInput);
+    await submitWager.execute(
+      createRequest(wallet, {
+        money: { amount: "5.00", currency: "BRL" },
+      }),
+    );
+
+    const rollback = await submitWager.execute(
+      createRequest(wallet, {
+        kind: WagerTransactionKind.ROLLBACK,
+        referenceExternalTransactionId: winInput.externalTransactionId,
+        money: { amount: "5.00", currency: "BRL" },
+      }),
+    );
+
+    expect(rollback.status).toBe(WagerTransactionStatus.REJECTED);
+    expect(rollback.failureCode).toBe(FailureCode.REVERSAL_WOULD_OVERDRAW);
+    expect(rollback.balance).toEqual({ amount: "0.00", currency: "BRL" });
+    expect(await ledgerCount(rollback.transactionId)).toBe(0);
+    await assertWalletMatchesLedger(wallet.id);
+  });
+
+  it("serializes concurrent REFUND and ROLLBACK so a BET is credited only once", async () => {
+    const wallet = await createWallet.execute({
+      playerId: Bun.randomUUIDv7(),
+      initialBalance: { amount: "50.00", currency: "BRL" },
+    });
+    const betInput = createRequest(wallet, {
+      money: { amount: "20.00", currency: "BRL" },
+    });
+    await submitWager.execute(betInput);
+    const refundInput = createRequest(wallet, {
+      kind: WagerTransactionKind.REFUND,
+      referenceExternalTransactionId: betInput.externalTransactionId,
+      money: { amount: "20.00", currency: "BRL" },
+    });
+    const rollbackInput = createRequest(wallet, {
+      kind: WagerTransactionKind.ROLLBACK,
+      referenceExternalTransactionId: betInput.externalTransactionId,
+      money: { amount: "20.00", currency: "BRL" },
+    });
+
+    const results = await Promise.all([
+      submitWager.execute(refundInput),
+      submitWager.execute(rollbackInput),
+    ]);
+
+    const processed = results.find(
+      (result) => result.status === WagerTransactionStatus.PROCESSED,
+    );
+    const rejected = results.find(
+      (result) => result.status === WagerTransactionStatus.REJECTED,
+    );
+    expect(processed).toBeDefined();
+    expect(rejected?.failureCode).toBe(FailureCode.ALREADY_REVERSED);
+    expect(await ledgerCount(processed!.transactionId, "CREDIT")).toBe(1);
+    expect(await ledgerCount(rejected!.transactionId)).toBe(0);
+    expect(results.filter((result) => result.status === WagerTransactionStatus.PROCESSED))
+      .toHaveLength(1);
+    expect((await unitOfWork.run((tx) =>
+      tx.wallets.findByIdForUpdate(wallet.id),
+    ))?.balance.toString()).toBe("50.00");
+    await assertWalletMatchesLedger(wallet.id);
+  });
+
   it("does not write the wallet row when processing LOSS", async () => {
     const wallet = await createWallet.execute({
       playerId: Bun.randomUUIDv7(),
@@ -349,7 +606,8 @@ describe("wagering application use cases", () => {
     expect(currencyResult.status).toBe(WagerTransactionStatus.REJECTED);
     expect(currencyResult.failureCode).toBe(FailureCode.CURRENCY_MISMATCH);
     expect(currencyResult.balance).toEqual({ amount: "10.00", currency: "BRL" });
-    expect((await readTransaction(currencyMismatch))?.observedBalance.currency).toBe("BRL");
+    expect((await readTransaction(currencyMismatch))?.observedBalance?.currency)
+      .toBe("BRL");
     await assertWalletMatchesLedger(wallet.id);
   });
 

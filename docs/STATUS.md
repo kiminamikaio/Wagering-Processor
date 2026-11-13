@@ -1,6 +1,6 @@
 # Status do projeto
 
-Atualizado em: 2026-11-12
+Atualizado em: 2026-11-13
 
 ## Etapas concluídas
 
@@ -36,7 +36,15 @@ Implementados em `src/wagering/domain/`:
 - `SubmitWagerTransactionUseCase` processa BET/WIN/LOSS, persiste rejeições, aplica replay idempotente, grava ledger e outbox atomicamente; REFUND/ROLLBACK/OPENING são rejeitados antes de abrir a transação.
 - `CreateWalletUseCase` cria wallets com ou sem saldo inicial; saldo positivo grava OPENING, ledger CREDIT e eventos na mesma transação.
 - Testes PostgreSQL cobrem processamento, replay e conflito, rejeições, eventos, criação de wallet e duas apostas simultâneas disputando o mesmo saldo. Ainda não foram adicionados controllers ou módulos NestJS.
-- Para a etapa 7: transações `PENDING_REFERENCE` podem não ter `observed_balance`; o replay deverá aceitar saldo observado ausente e a resposta HTTP será `202` sem saldo.
+- Transações `PENDING_REFERENCE` podem não ter `observed_balance`; a etapa 7 implementa o replay sem saldo observado, permitindo resposta HTTP `202` sem saldo.
+
+### Etapa 7 — REFUND, ROLLBACK e referências pendentes
+
+- `REFUND` e `ROLLBACK` agora são processados após o lock da wallet, resolvendo a referência por provider e ID externo dentro da mesma transação; a lógica de resolução ficou reutilizável para o worker futuro.
+- Referência ausente gera `PENDING_REFERENCE` e evento de outbox, sem saldo/ledger observado; replay preserva o saldo ausente. Estornos válidos gravam `reference_transaction_id` e ledger atômico, com `REFUND` como crédito e `ROLLBACK` na direção inversa.
+- Validações persistem rejeições com `REFERENCE_MISMATCH`, `INVALID_REFERENCE_KIND`, `AMOUNT_MISMATCH`, `ALREADY_REVERSED` ou `REVERSAL_WOULD_OVERDRAW`.
+- Decisão: cada transação referenciada pode ter no máximo um estorno processado no total, seja `REFUND` ou `ROLLBACK`; migration ajusta o índice único parcial como segunda proteção contra concorrência.
+- Testes PostgreSQL cobrem REFUND de BET, ROLLBACK de WIN, referência fora de ordem, rejeições de referência/valor, overdraw e corrida REFUND/ROLLBACK sobre a mesma BET. O worker da etapa 12 não foi criado.
 
 ## Validação executada
 
