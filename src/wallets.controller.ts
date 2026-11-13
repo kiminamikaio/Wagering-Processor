@@ -3,6 +3,7 @@ import {
   Controller,
   Get,
   Inject,
+  HttpCode,
   Param,
   Post,
   Query,
@@ -21,6 +22,9 @@ import {
 } from "./http/http-validation";
 import { HTTP_READ_REPOSITORY } from "./http/tokens";
 import { MikroOrmHttpReadRepository } from "./wagering/infrastructure/database/http-read-repository";
+import { jsonLogger } from "./observability/json-logger";
+import { metricsRegistry } from "./observability/metrics-registry";
+import { currentLogContext } from "./observability/correlation-context";
 
 function walletResponse(wallet: Wallet) {
   return {
@@ -89,6 +93,36 @@ export class WalletsController {
         page.hasMore && lastEntry !== undefined
           ? encodeLedgerCursor(lastEntry.seq)
           : null,
+    };
+  }
+
+  @Post(":walletId/reconciliation")
+  @HttpCode(200)
+  async reconcile(@Param("walletId") rawId: string) {
+    const walletId = parseWalletId(rawId);
+    const result = await this.readRepository.reconcileWallet(walletId);
+    if (result === undefined) {
+      throw new WalletNotFoundError(walletId);
+    }
+
+    const difference = result.storedBalance.subtract(result.calculatedBalance);
+    const consistent = difference.isZero();
+    if (!consistent) {
+      metricsRegistry.increment("reconciliation_divergences_total");
+      jsonLogger.event(
+        "error",
+        "Wallet reconciliation divergence detected.",
+        { ...currentLogContext(), walletId },
+        "WalletsController",
+      );
+    }
+    return {
+      walletId,
+      storedBalance: result.storedBalance.toJSON(),
+      calculatedBalance: result.calculatedBalance.toJSON(),
+      difference: difference.toJSON(),
+      consistent,
+      checkedEntries: result.checkedEntries,
     };
   }
 }

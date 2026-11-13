@@ -1,4 +1,11 @@
-import { Inject, Injectable, Module, OnApplicationShutdown } from "@nestjs/common";
+import {
+  Inject,
+  Injectable,
+  MiddlewareConsumer,
+  Module,
+  NestModule,
+  OnApplicationShutdown,
+} from "@nestjs/common";
 import { MikroORM } from "@mikro-orm/postgresql";
 import { APP_FILTER } from "@nestjs/core";
 import { HealthController } from "./health.controller";
@@ -7,6 +14,7 @@ import {
   CLOCK,
   HTTP_READ_REPOSITORY,
   ID_GENERATOR,
+  SQS_CLIENT,
   WAGERING_UNIT_OF_WORK,
 } from "./http/tokens";
 import { Clock, IdGenerator, WageringUnitOfWork } from "./wagering/application/ports/wagering-unit-of-work";
@@ -32,8 +40,10 @@ import {
   PendingReferenceWorker,
   pendingReferenceWorkerOptionsFromEnvironment,
 } from "./wagering/infrastructure/reference/pending-reference-worker";
+import { MetricsController } from "./observability/metrics.controller";
+import { CorrelationMiddleware } from "./observability/correlation.middleware";
+import { MetricsRegistry, metricsRegistry } from "./observability/metrics-registry";
 
-const SQS_CLIENT = Symbol("SQS_CLIENT");
 const SQS_CONSUMER_CLIENT = Symbol("SQS_CONSUMER_CLIENT");
 
 @Injectable()
@@ -51,11 +61,17 @@ class MikroOrmLifecycle implements OnApplicationShutdown {
     WalletsController,
     WageringController,
     ProviderWageringController,
+    MetricsController,
   ],
   providers: [
     {
       provide: MikroORM,
-      useFactory: () => MikroORM.init(mikroOrmConfig),
+      useFactory: () =>
+        MikroORM.init({
+          ...mikroOrmConfig,
+          clientUrl: process.env.DATABASE_URL ?? mikroOrmConfig.clientUrl,
+          connect: false,
+        }),
     },
     {
       provide: SQS_CLIENT,
@@ -65,6 +81,7 @@ class MikroOrmLifecycle implements OnApplicationShutdown {
       provide: SQS_CONSUMER_CLIENT,
       useFactory: createOutboxSqsClient,
     },
+    { provide: MetricsRegistry, useValue: metricsRegistry },
     {
       provide: SqsOutboxPublisher,
       useFactory: (
@@ -143,4 +160,16 @@ class MikroOrmLifecycle implements OnApplicationShutdown {
     { provide: APP_FILTER, useClass: ApiExceptionFilter },
   ],
 })
-export class AppModule {}
+export class AppModule implements NestModule {
+  configure(consumer: MiddlewareConsumer): void {
+    consumer
+      .apply(CorrelationMiddleware)
+      .forRoutes(
+        HealthController,
+        WalletsController,
+        WageringController,
+        ProviderWageringController,
+        MetricsController,
+      );
+  }
+}

@@ -5,6 +5,8 @@ import { INestApplication } from "@nestjs/common";
 import { NestFactory } from "@nestjs/core";
 import { MikroORM } from "@mikro-orm/postgresql";
 import { AppModule } from "./app.module";
+import { metricsRegistry } from "./observability/metrics-registry";
+import { executeRows } from "./wagering/infrastructure/database/sql";
 
 let app: INestApplication;
 let baseUrl: string;
@@ -240,5 +242,185 @@ describe("HTTP API (NestJS + PostgreSQL)", () => {
     const second = await secondResponse.json();
     expect(second.items).toHaveLength(1);
     expect(second.items[0].id).not.toBe(first.items[0].id);
+  });
+
+  it("reconciles the ledger after BET, WIN, REFUND, and ROLLBACK", async () => {
+    const playerId = Bun.randomUUIDv7();
+    const created = await postJson("/wallets", {
+      playerId,
+      initialBalance: { amount: "20.00", currency: "BRL" },
+    });
+    const wallet = await created.json();
+    const bet = wagerBody(wallet.id, playerId, {
+      money: { amount: "2.00", currency: "BRL" },
+    });
+    const win = wagerBody(wallet.id, playerId, {
+      kind: "WIN",
+      money: { amount: "3.00", currency: "BRL" },
+    });
+    const refund = wagerBody(wallet.id, playerId, {
+      kind: "REFUND",
+      referenceExternalTransactionId: bet.externalTransactionId,
+      money: { amount: "2.00", currency: "BRL" },
+    });
+    const rollback = wagerBody(wallet.id, playerId, {
+      kind: "ROLLBACK",
+      referenceExternalTransactionId: win.externalTransactionId,
+      money: { amount: "3.00", currency: "BRL" },
+    });
+
+    for (const [body, key] of [
+      [bet, `key-${Bun.randomUUIDv7()}`],
+      [win, `key-${Bun.randomUUIDv7()}`],
+      [refund, `key-${Bun.randomUUIDv7()}`],
+      [rollback, `key-${Bun.randomUUIDv7()}`],
+    ] as const) {
+      const response = await postJson("/wagering/transactions", body, key);
+      expect(response.status).toBe(200);
+    }
+
+    const response = await fetch(
+      `${baseUrl}/wallets/${wallet.id}/reconciliation`,
+      { method: "POST" },
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      walletId: wallet.id,
+      storedBalance: { amount: "20.00", currency: "BRL" },
+      calculatedBalance: { amount: "20.00", currency: "BRL" },
+      difference: { amount: "0.00", currency: "BRL" },
+      consistent: true,
+      checkedEntries: 5,
+    });
+  });
+
+  it("reports ledger divergence without correcting the wallet and increments its metric", async () => {
+    const playerId = Bun.randomUUIDv7();
+    const created = await postJson("/wallets", {
+      playerId,
+      initialBalance: { amount: "10.00", currency: "BRL" },
+    });
+    const wallet = await created.json();
+    const before = metricsRegistry.counterValue("reconciliation_divergences_total");
+    await app
+      .get(MikroORM)
+      .em.getConnection()
+      .execute("UPDATE wallets SET balance_cents = balance_cents + 100 WHERE id = ?", [
+        wallet.id,
+      ]);
+
+    const response = await fetch(
+      `${baseUrl}/wallets/${wallet.id}/reconciliation`,
+      { method: "POST" },
+    );
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      walletId: wallet.id,
+      storedBalance: { amount: "11.00", currency: "BRL" },
+      calculatedBalance: { amount: "10.00", currency: "BRL" },
+      difference: { amount: "1.00", currency: "BRL" },
+      consistent: false,
+      checkedEntries: 1,
+    });
+    expect(metricsRegistry.counterValue("reconciliation_divergences_total")).toBe(
+      before + 1,
+    );
+    const stillDivergent = await fetch(
+      `${baseUrl}/wallets/${wallet.id}/reconciliation`,
+      { method: "POST" },
+    );
+    expect((await stillDivergent.json()).consistent).toBe(false);
+  });
+
+  it("returns 404 for a missing reconciliation wallet", async () => {
+    const response = await fetch(
+      `${baseUrl}/wallets/${Bun.randomUUIDv7()}/reconciliation`,
+      { method: "POST" },
+    );
+    expect(response.status).toBe(404);
+  });
+
+  it("exposes request correlation and Prometheus counters without transaction payloads", async () => {
+    const playerId = Bun.randomUUIDv7();
+    const created = await postJson("/wallets", {
+      playerId,
+      initialBalance: { amount: "5.00", currency: "BRL" },
+    });
+    const wallet = await created.json();
+    const wager = wagerBody(wallet.id, playerId, {
+      money: { amount: "2.00", currency: "BRL" },
+    });
+    const idempotencyKey = `key-${Bun.randomUUIDv7()}`;
+    const correlationId = `correlation-${Bun.randomUUIDv7()}`;
+    const initialProcessed = metricsRegistry.counterValue(
+      "wager_transactions_total",
+      { status: "PROCESSED", type: "BET", channel: "http" },
+    );
+    const initialRejected = metricsRegistry.counterValue(
+      "wager_transactions_total",
+      { status: "REJECTED", type: "BET", channel: "http" },
+    );
+    const first = await fetch(`${baseUrl}/wagering/transactions`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "idempotency-key": idempotencyKey,
+        "x-correlation-id": correlationId,
+      },
+      body: JSON.stringify(wager),
+    });
+    expect(first.headers.get("x-correlation-id")).toBe(correlationId);
+    expect(first.status).toBe(200);
+    const firstBody = await first.json();
+    const replay = await postJson("/wagering/transactions", wager, idempotencyKey);
+    expect((await replay.json()).idempotentReplay).toBe(true);
+
+    const rejected = await postJson(
+      "/wagering/transactions",
+      wagerBody(wallet.id, playerId, {
+        money: { amount: "99.00", currency: "BRL" },
+      }),
+      `key-${Bun.randomUUIDv7()}`,
+    );
+    expect(rejected.status).toBe(422);
+
+    const eventRows = await executeRows(
+      app.get(MikroORM).em.fork(),
+      `SELECT payload->>'correlationId' AS correlation_id
+       FROM outbox_messages
+      WHERE event_type = 'WagerTransactionProcessed'
+        AND payload->'data'->>'transactionId' = ?`,
+      [firstBody.transactionId],
+    );
+    expect(eventRows).toHaveLength(1);
+    expect(eventRows[0]!.correlation_id).toBe(correlationId);
+    expect(
+      metricsRegistry.counterValue("wager_transactions_total", {
+        status: "PROCESSED",
+        type: "BET",
+        channel: "http",
+      }),
+    ).toBe(initialProcessed + 2);
+    expect(
+      metricsRegistry.counterValue("wager_transactions_total", {
+        status: "REJECTED",
+        type: "BET",
+        channel: "http",
+      }),
+    ).toBe(initialRejected + 1);
+    expect(
+      metricsRegistry.counterValue("idempotency_duplicates_total", {
+        channel: "http",
+      }),
+    ).toBeGreaterThan(0);
+
+    const metrics = await fetch(`${baseUrl}/metrics`);
+    expect(metrics.status).toBe(200);
+    const metricsText = await metrics.text();
+    expect(metrics.headers.get("content-type")).toContain("text/plain");
+    expect(metricsText).toContain("outbox_lag_seconds ");
+    expect(metricsText).toContain("transaction_processing_duration_seconds_bucket");
+    expect(metricsText).not.toContain(wager.money.amount);
+    expect(metricsText).not.toContain(idempotencyKey);
   });
 });

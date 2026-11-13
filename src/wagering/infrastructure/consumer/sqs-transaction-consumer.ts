@@ -26,6 +26,9 @@ import {
 import { SubmitWagerTransactionUseCase } from "../../application/submit-wager-transaction.use-case";
 import { parseSubmitWagerInput } from "../../../http/http-validation";
 import { InvalidMoneyError } from "../../../shared/domain/errors";
+import { runWithLogContext } from "../../../observability/correlation-context";
+import { jsonLogger } from "../../../observability/json-logger";
+import { metricsRegistry } from "../../../observability/metrics-registry";
 import {
   InvalidLedgerEntryError,
   InvalidMoneyAmountError,
@@ -63,6 +66,7 @@ interface SqsSender {
 
 interface ParsedEnvelope {
   messageId: string;
+  correlationId?: string;
   payload: Record<string, unknown>;
   walletId: string;
   input: ReturnType<typeof parseSubmitWagerInput>;
@@ -119,6 +123,15 @@ function parseEnvelope(
   if (typeof payload.messageId !== "string" || payload.messageId.trim().length === 0) {
     throw new PermanentMessageError("INVALID_SCHEMA", "messageId must be a non-empty string.");
   }
+  if (
+    payload.correlationId !== undefined &&
+    (typeof payload.correlationId !== "string" || payload.correlationId.trim().length === 0)
+  ) {
+    throw new PermanentMessageError(
+      "INVALID_SCHEMA",
+      "correlationId must be a non-empty string.",
+    );
+  }
   if (payload.type !== "WagerTransactionRequested") {
     throw new PermanentMessageError("INVALID_SCHEMA", "Message type is not supported.");
   }
@@ -156,6 +169,9 @@ function parseEnvelope(
 
   return {
     messageId: payload.messageId,
+    ...(typeof payload.correlationId === "string"
+      ? { correlationId: payload.correlationId }
+      : {}),
     payload,
     walletId: input.walletId,
     input,
@@ -331,17 +347,47 @@ export class SqsTransactionConsumer
 
     let result: Awaited<ReturnType<SubmitWagerTransactionUseCase["execute"]>>;
     try {
-      result = await this.submitWager.execute({
-        ...envelope.input,
-        inbox: {
-          consumerName: this.options.consumerName,
+      result = await runWithLogContext(
+        {
           messageId: envelope.messageId,
-          payloadHash: createHash("sha256")
-            .update(JSON.stringify(envelope.payload))
-            .digest("hex"),
-          payload: envelope.payload,
+          ...(envelope.correlationId === undefined
+            ? {}
+            : { correlationId: envelope.correlationId }),
+          walletId: envelope.walletId,
+          providerId: envelope.input.providerId,
         },
-      });
+        async () => {
+          const output = await this.submitWager.execute({
+            ...envelope.input,
+            ...(envelope.correlationId === undefined
+              ? {}
+              : { correlationId: envelope.correlationId }),
+            inbox: {
+              consumerName: this.options.consumerName,
+              messageId: envelope.messageId,
+              payloadHash: createHash("sha256")
+                .update(JSON.stringify(envelope.payload))
+                .digest("hex"),
+              payload: envelope.payload,
+            },
+          });
+          jsonLogger.event(
+            "info",
+            "SQS wager message committed.",
+            {
+              messageId: envelope.messageId,
+              ...(envelope.correlationId === undefined
+                ? {}
+                : { correlationId: envelope.correlationId }),
+              transactionId: output.transactionId,
+              walletId: envelope.walletId,
+              providerId: envelope.input.providerId,
+            },
+            "SqsTransactionConsumer",
+          );
+          return output;
+        },
+      );
     } catch (error) {
       const errorCode = permanentErrorCode(error);
       if (errorCode !== undefined) {
@@ -380,6 +426,17 @@ export class SqsTransactionConsumer
       Number.isSafeInteger(receiveCount) && receiveCount > 0 ? receiveCount : 1,
       this.options.retryMaxDelaySeconds,
     );
+    metricsRegistry.increment("retries_total", { component: "consumer" });
+    const correlationId = this.correlationIdFromMessage(message);
+    jsonLogger.event(
+      "warn",
+      "SQS message scheduled for retry.",
+      {
+        messageId: message.MessageId,
+        ...(correlationId === undefined ? {} : { correlationId }),
+      },
+      "SqsTransactionConsumer",
+    );
     try {
       await this.sender.send(
         new ChangeMessageVisibilityCommand({
@@ -389,12 +446,18 @@ export class SqsTransactionConsumer
         }),
       );
     } catch (visibilityError) {
-      this.logger.warn(
-        `Could not extend visibility for SQS message: ${this.errorSummary(visibilityError)}`,
+      jsonLogger.event(
+        "warn",
+        `Could not extend SQS message visibility: ${this.errorSummary(visibilityError)}`,
+        { messageId: message.MessageId, ...(correlationId ? { correlationId } : {}) },
+        "SqsTransactionConsumer",
       );
     }
-    this.logger.warn(
-      `Transient SQS consumer failure (receive ${receiveCount}): ${this.errorSummary(error)}`,
+    jsonLogger.event(
+      "warn",
+      `Transient SQS consumer failure: ${this.errorSummary(error)}`,
+      { messageId: message.MessageId, ...(correlationId ? { correlationId } : {}) },
+      "SqsTransactionConsumer",
     );
     return false;
   }
@@ -432,7 +495,34 @@ export class SqsTransactionConsumer
         error,
       );
     }
+    metricsRegistry.increment("dlq_messages_total", { reason: errorCode });
+    const correlationId = this.correlationIdFromMessage(message);
+    jsonLogger.event(
+      "error",
+      "SQS message sent to DLQ.",
+      {
+        messageId: message.MessageId,
+        ...(correlationId === undefined ? {} : { correlationId }),
+      },
+      "SqsTransactionConsumer",
+    );
     return this.deleteMessage(receiptHandle);
+  }
+
+  private correlationIdFromMessage(message: Message): string | undefined {
+    try {
+      const body: unknown = JSON.parse(message.Body ?? "");
+      if (
+        isRecord(body) &&
+        typeof body.correlationId === "string" &&
+        body.correlationId.length > 0
+      ) {
+        return body.correlationId;
+      }
+    } catch {
+      return undefined;
+    }
+    return undefined;
   }
 
   private async deleteMessage(receiptHandle: string): Promise<boolean> {

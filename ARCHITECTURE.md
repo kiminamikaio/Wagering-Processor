@@ -123,3 +123,45 @@ promptly. On `SIGTERM`, the consumer stops receiving, finishes started
 messages, and changes visibility to zero for messages not yet started in the
 received batch. Set `SQS_CONSUMER_ENABLED=true` to start the background
 long-poll loop; `pollOnce()` remains available for controlled processing.
+
+## Observability
+
+`GET /health/live` reports process liveness only and does not contact a
+dependency. `GET /health/ready` checks PostgreSQL with `SELECT 1` and the
+`wager-transactions.fifo` queue with `GetQueueAttributes` concurrently; each
+check has a two-second timeout. The ORM connection is lazy so the process can
+start and answer liveness probes when PostgreSQL is unavailable. Both health
+routes are public.
+
+HTTP requests use `X-Correlation-Id` when supplied or receive a generated ID;
+the response returns that ID. SQS envelopes carry their correlation ID into the
+consumer, application use case, transactional outbox events, publisher, and
+pending-reference worker through `AsyncLocalStorage`. Each JSON log line
+contains a timestamp, level, message, context, and any available
+`correlationId`, `messageId`, `transactionId`, `walletId`, and `providerId`.
+Logs never contain request/message payloads, monetary values, balances, or
+authorization headers.
+
+`GET /metrics` exposes Prometheus text for:
+
+- `wager_transactions_total{status,type,channel}`
+- `idempotency_duplicates_total{channel}`
+- `retries_total{component}` (`consumer`, `outbox`, `pending_reference`)
+- `dlq_messages_total{reason}`
+- `lock_conflicts_total`
+- `reconciliation_divergences_total`
+- `outbox_unpublished_count`, `outbox_lag_seconds`,
+  `pending_reference_count`, and `dlq_queue_depth`
+- `transaction_processing_duration_seconds{channel}` histogram
+
+Counters and histogram observations are held in memory per service instance and
+reset on restart; production Prometheus should scrape and aggregate all
+instances. Outbox and pending-reference gauges are read from PostgreSQL, and DLQ
+depth comes from SQS.
+
+`POST /wallets/:walletId/reconciliation` reads the wallet balance with
+`SELECT ... FOR SHARE` and sums its append-only ledger in the same SQL
+transaction. The SQL sum remains `BIGINT`/string-backed and is converted to the
+`Money` value object without floating-point arithmetic. A mismatch is returned
+as a divergence, logged at error level, and counted; reconciliation never
+silently corrects a wallet.

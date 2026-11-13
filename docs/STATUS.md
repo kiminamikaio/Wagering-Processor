@@ -88,6 +88,15 @@ Implementados em `src/wagering/domain/`:
 - Worker integrado ao ciclo de vida NestJS, `runOnce()` manual, `Clock` substituível e shutdown aguardando o lote. Não foi necessária migration: campos e índice parcial já existiam.
 - Testes PostgreSQL cobrem resolução e replay HTTP, tentativa/TTL, vencimento, mismatch de valor/rodada, overdraw, duas reversões para a mesma referência, concorrência de dois workers em 20 pendências, concorrência com 20 BETs HTTP e referência resolvida após BET via SQS; os cenários verificam o ledger.
 
+### Etapa 13 — health, observabilidade e reconciliação
+
+- `GET /health/live` segue independente de infraestrutura; `GET /health/ready` testa PostgreSQL e `wager-transactions.fifo` em paralelo, com timeout individual de dois segundos e diagnóstico por dependência. Ambos permanecem públicos.
+- Adicionado logger JSON como `LoggerService`, middleware HTTP para gerar/propagar `X-Correlation-Id` e contexto `AsyncLocalStorage` também no consumidor SQS, publisher e worker. Os eventos de outbox mantêm a correlação recebida no envelope.
+- Logs de transações processadas/rejeitadas/pendentes, duplicatas, retries, DLQ, lock timeout, falha de publish e divergência usam campos permitidos e não serializam payload, dados financeiros, saldo ou headers de autenticação.
+- `/metrics` expõe contadores e histograma em registry em memória por instância; gauges de outbox, referências pendentes e DLQ são consultados no banco/SQS durante cada scrape. A agregação de produção deve ser feita pelo Prometheus.
+- Adicionada reconciliação protegida por AuthGuard; o saldo e a soma BIGINT do ledger são lidos na mesma transação com `SELECT ... FOR SHARE`. Divergências são sinalizadas, logadas e contabilizadas, sem correção automática.
+- Testes adicionados para readiness com dependência SQS indisponível, reconciliação após operações, divergência sem correção, propagação de correlação, métricas e filtragem de campos sensíveis nos logs.
+
 ## Validação executada
 
 Sequência de migrations:
@@ -127,4 +136,9 @@ Validação da etapa 11:
 Validação da etapa 12:
 
 1. `bun test` — três execuções consecutivas: cada uma com 141 testes aprovados, 0 falhas e 1952 assertions, incluindo PostgreSQL e MiniStack reais.
+2. `bun run typecheck` — sucesso (`tsc --noEmit`, exit code 0).
+
+Validação da etapa 13:
+
+1. `bun test` — três execuções consecutivas: cada uma com 150 testes aprovados, 0 falhas e 2150 assertions, incluindo PostgreSQL e MiniStack reais.
 2. `bun run typecheck` — sucesso (`tsc --noEmit`, exit code 0).

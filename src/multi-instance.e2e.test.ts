@@ -253,4 +253,75 @@ describe("HTTP concurrency across three real app processes", () => {
     ).toBe(2);
     await assertWalletMatchesLedger(orm.em, wallet.id);
   });
+
+  it("recovers 30 idempotent wagers after killing and restarting an app mid-flight", async () => {
+    const wallets = await Promise.all(
+      Array.from({ length: 3 }, async () => (await createWallet("100.00")).wallet),
+    );
+    const requests = wallets.flatMap((wallet) =>
+      Array.from({ length: 10 }, () => ({
+        body: wagerBody(wallet, "1.00"),
+        key: idempotencyKey(),
+      })),
+    );
+    const inFlight = requests.map(({ body, key }, index) =>
+      submit(body, key, index).then(
+        (result) => ({ result }),
+        (error: unknown) => ({ error }),
+      ),
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 1));
+    const stopped = children[1]!;
+    stopped.kill("SIGKILL");
+    await stopped.exited;
+    children[1] = Bun.spawn([process.execPath, "src/main.ts"], {
+      cwd: process.cwd(),
+      env: { ...process.env, PORT: String(ports[1]!) },
+      stdout: "inherit",
+      stderr: "inherit",
+    });
+    await waitForHealth(children[1]!, ports[1]!);
+    await Promise.all(inFlight);
+
+    const replays = await Promise.all(
+      requests.map(({ body, key }, index) => submit(body, key, index + 1)),
+    );
+    expect(replays.every((result) => result.status === 200)).toBe(true);
+
+    for (const wallet of wallets) {
+      expect(
+        await rowCount(
+          `SELECT COUNT(*)::text AS count
+           FROM wager_transactions
+           WHERE wallet_id = ? AND kind = 'BET'`,
+          [wallet.id],
+        ),
+      ).toBe(10);
+      expect(
+        await rowCount(
+          `SELECT COUNT(*)::text AS count
+           FROM wallet_ledger_entries
+           WHERE wallet_id = ? AND direction = 'DEBIT'`,
+          [wallet.id],
+        ),
+      ).toBe(10);
+      const reconciliation = await fetch(
+        `http://127.0.0.1:${ports[0]!}/wallets/${wallet.id}/reconciliation`,
+        { method: "POST" },
+      );
+      expect(reconciliation.status).toBe(200);
+      expect((await reconciliation.json()).consistent).toBe(true);
+      await assertWalletMatchesLedger(orm.em, wallet.id);
+    }
+
+    for (const { key } of requests) {
+      expect(
+        await rowCount(
+          "SELECT COUNT(*)::text AS count FROM wager_transactions WHERE idempotency_key = ?",
+          [key],
+        ),
+      ).toBe(1);
+    }
+  });
 });

@@ -51,6 +51,7 @@ interface WalletFixture {
 
 interface TestEnvelope {
   messageId: string;
+  correlationId?: string;
   type: "WagerTransactionRequested";
   occurredAt: string;
   data: SubmitWagerTransactionInput;
@@ -278,7 +279,10 @@ describe("SQS transaction consumer with PostgreSQL and MiniStack", () => {
 
   it("commits a BET, inbox, ledger and outbox before acknowledging", async () => {
     const wallet = await createWallet();
-    const message = envelope(wagerInput(wallet));
+    const message = {
+      ...envelope(wagerInput(wallet)),
+      correlationId: `correlation-${Bun.randomUUIDv7()}`,
+    };
     await sendEnvelope(message);
 
     await consumer().pollOnce();
@@ -299,8 +303,9 @@ describe("SQS transaction consumer with PostgreSQL and MiniStack", () => {
     expect(await countRows(
       `SELECT COUNT(*)::text AS count FROM outbox_messages
        WHERE aggregate_id = ?
-         AND payload->'data'->>'transactionId' = ?`,
-      [wallet.id, requiredString(transactions[0]!, "id")],
+         AND payload->'data'->>'transactionId' = ?
+         AND payload->>'correlationId' = ?`,
+      [wallet.id, requiredString(transactions[0]!, "id"), message.correlationId],
     )).toBe(2);
     await assertWalletMatchesLedger(orm.em, wallet.id);
   });

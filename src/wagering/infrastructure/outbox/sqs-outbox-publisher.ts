@@ -1,12 +1,14 @@
 import {
   Injectable,
-  Logger,
   OnApplicationShutdown,
   OnModuleInit,
 } from "@nestjs/common";
 import { EntityManager } from "@mikro-orm/core";
 import { SendMessageCommand, SQSClient } from "@aws-sdk/client-sqs";
 import { executeRows, executeStatement, requiredInteger, requiredString } from "../database/sql";
+import { runWithLogContext } from "../../../observability/correlation-context";
+import { jsonLogger } from "../../../observability/json-logger";
+import { metricsRegistry } from "../../../observability/metrics-registry";
 
 export interface OutboxClock {
   now(): Date;
@@ -72,7 +74,6 @@ function retryDelayMs(attemptCount: number): number {
 export class SqsOutboxPublisher
   implements OnModuleInit, OnApplicationShutdown
 {
-  private readonly logger = new Logger(SqsOutboxPublisher.name);
   private stopping = false;
   private loopPromise: Promise<void> | undefined;
   private timer: ReturnType<typeof setTimeout> | undefined;
@@ -121,8 +122,12 @@ export class SqsOutboxPublisher
       } catch (error) {
         await this.scheduleRetry(message, error);
         failed += 1;
-        this.logger.warn(
-          `Outbox row ${message.id} failed for ${message.aggregateId}: ${errorSummary(error)}`,
+        metricsRegistry.increment("retries_total", { component: "outbox" });
+        jsonLogger.event(
+          "error",
+          `Outbox publish failed: ${errorSummary(error)}`,
+          this.messageLogContext(message),
+          "SqsOutboxPublisher",
         );
       }
     }
@@ -176,14 +181,45 @@ export class SqsOutboxPublisher
   }
 
   async sendClaimed(message: ClaimedOutboxMessage): Promise<void> {
-    await this.sender.send(
-      new SendMessageCommand({
-        QueueUrl: this.options.queueUrl,
-        MessageGroupId: message.aggregateId,
-        MessageDeduplicationId: eventIdOf(message.payload),
-        MessageBody: JSON.stringify(message.payload),
-      }),
+    await runWithLogContext(
+      this.messageLogContext(message),
+      () =>
+        this.sender.send(
+          new SendMessageCommand({
+            QueueUrl: this.options.queueUrl,
+            MessageGroupId: message.aggregateId,
+            MessageDeduplicationId: eventIdOf(message.payload),
+            MessageBody: JSON.stringify(message.payload),
+          }),
+        ),
     );
+  }
+
+  private messageLogContext(message: ClaimedOutboxMessage) {
+    const data = message.payload.data;
+    const providerId =
+      typeof data === "object" &&
+      data !== null &&
+      "providerId" in data &&
+      typeof data.providerId === "string"
+        ? data.providerId
+        : undefined;
+    const transactionId =
+      typeof data === "object" &&
+      data !== null &&
+      "transactionId" in data &&
+      typeof data.transactionId === "string"
+        ? data.transactionId
+        : undefined;
+    return {
+      ...(typeof message.payload.correlationId === "string"
+        ? { correlationId: message.payload.correlationId }
+        : {}),
+      messageId: eventIdOf(message.payload),
+      ...(transactionId === undefined ? {} : { transactionId }),
+      walletId: message.aggregateId,
+      ...(providerId === undefined ? {} : { providerId }),
+    };
   }
 
   private async markPublished(id: string): Promise<void> {
@@ -225,8 +261,11 @@ export class SqsOutboxPublisher
       try {
         await this.publishOnce();
       } catch (error) {
-        this.logger.error(
+        jsonLogger.event(
+          "error",
           `Outbox publisher loop failed: ${errorSummary(error)}`,
+          {},
+          "SqsOutboxPublisher",
         );
       }
 

@@ -3,8 +3,9 @@ import {
   Catch,
   ExceptionFilter,
   HttpException,
-  Logger,
 } from "@nestjs/common";
+import { currentLogContext } from "../observability/correlation-context";
+import { jsonLogger } from "../observability/json-logger";
 import {
   IdempotencyConflictError,
   UnsupportedTransactionKindError,
@@ -70,8 +71,6 @@ function isTransientDatabaseError(error: unknown): boolean {
 
 @Catch()
 export class ApiExceptionFilter implements ExceptionFilter {
-  private readonly logger = new Logger(ApiExceptionFilter.name);
-
   catch(exception: unknown, host: ArgumentsHost): void {
     const response = host.switchToHttp().getResponse<HttpResponse>();
     let status = 500;
@@ -123,13 +122,28 @@ export class ApiExceptionFilter implements ExceptionFilter {
       code = "PERSISTENCE_ERROR";
       message = "A persistence error occurred.";
     } else if (exception instanceof Error) {
-      this.logger.error(exception.message, exception.stack);
+      jsonLogger.event(
+        "error",
+        `Unhandled API exception: ${exception.name}.`,
+        currentLogContext(),
+        "ApiExceptionFilter",
+      );
     } else {
-      this.logger.error("An unexpected non-error value was thrown.");
+      jsonLogger.event(
+        "error",
+        "An unexpected non-error value was thrown.",
+        currentLogContext(),
+        "ApiExceptionFilter",
+      );
     }
 
     if (status === 500) {
-      this.logger.error(`Returning ${code}.`);
+      jsonLogger.event(
+        "error",
+        `Returning ${code}.`,
+        currentLogContext(),
+        "ApiExceptionFilter",
+      );
     }
     response.status(status).json({ error: { code, message } });
   }

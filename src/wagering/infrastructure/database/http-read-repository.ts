@@ -4,6 +4,13 @@ import { Wallet } from "../../domain/wallet";
 import { WalletLedgerEntry } from "../../domain/wallet-ledger-entry";
 import { wagerTransactionFromRow, walletFromRow, walletLedgerEntryFromRow } from "./row-mappers";
 import { executeRows, requiredString } from "./sql";
+import { Money } from "../../../shared/domain/money";
+
+export interface WalletReconciliation {
+  storedBalance: Money;
+  calculatedBalance: Money;
+  checkedEntries: number;
+}
 
 export interface LedgerPage {
   entries: Array<{ entry: WalletLedgerEntry; seq: string }>;
@@ -23,6 +30,56 @@ export class MikroOrmHttpReadRepository {
     );
 
     return rows[0] === undefined ? undefined : walletFromRow(rows[0]);
+  }
+
+  async reconcileWallet(id: string): Promise<WalletReconciliation | undefined> {
+    return this.em.fork().transactional(async (em) => {
+      const wallets = await executeRows(
+        em,
+        `SELECT id, currency, balance_cents::text AS balance_cents
+         FROM wallets
+         WHERE id = ?
+         FOR SHARE`,
+        [id],
+      );
+      const wallet = wallets[0];
+      if (wallet === undefined) {
+        return undefined;
+      }
+
+      const totals = await executeRows(
+        em,
+        `SELECT COALESCE(
+                  SUM(
+                    CASE direction
+                      WHEN 'CREDIT' THEN amount_cents
+                      ELSE -amount_cents
+                    END
+                  ),
+                  0
+                )::text AS calculated_cents,
+                COUNT(*)::text AS checked_entries
+         FROM wallet_ledger_entries
+         WHERE wallet_id = ?`,
+        [id],
+      );
+      const checkedEntries = BigInt(requiredString(totals[0]!, "checked_entries"));
+      if (checkedEntries > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new RangeError("Ledger entry count exceeds the supported response range.");
+      }
+      const currency = requiredString(wallet, "currency").trim();
+      return {
+        storedBalance: Money.fromCents(
+          BigInt(requiredString(wallet, "balance_cents")),
+          currency,
+        ),
+        calculatedBalance: Money.fromCents(
+          BigInt(requiredString(totals[0]!, "calculated_cents")),
+          currency,
+        ),
+        checkedEntries: Number(checkedEntries),
+      };
+    });
   }
 
   async findLedgerPage(

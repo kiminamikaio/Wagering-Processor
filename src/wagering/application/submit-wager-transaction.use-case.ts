@@ -36,6 +36,9 @@ import {
 } from "./ports/wagering-unit-of-work";
 import { WagerTransactionReferenceResolver } from "./wager-transaction-reference-resolver";
 import { REFERENCE_RETRY_BASE_MS } from "./reference-retry-policy";
+import { currentLogContext, runWithLogContext } from "../../observability/correlation-context";
+import { jsonLogger } from "../../observability/json-logger";
+import { metricsRegistry } from "../../observability/metrics-registry";
 
 export interface SubmitWagerTransactionInput {
   providerId: string;
@@ -74,6 +77,75 @@ export class SubmitWagerTransactionUseCase {
   }
 
   async execute(
+    input: SubmitWagerTransactionInput,
+  ): Promise<SubmitWagerTransactionOutput> {
+    const channel = input.inbox === undefined ? "http" : "sqs";
+    const startedAt = performance.now();
+    try {
+      const result = await runWithLogContext(
+        {
+          ...(input.correlationId === undefined
+            ? {}
+            : { correlationId: input.correlationId }),
+          walletId: input.walletId,
+          providerId: input.providerId,
+        },
+        () => this.executeTransaction(input),
+      );
+      metricsRegistry.recordTransaction(
+        result.status,
+        input.kind,
+        channel,
+        (performance.now() - startedAt) / 1_000,
+      );
+      const fields = {
+        ...currentLogContext(),
+        transactionId: result.transactionId,
+        walletId: input.walletId,
+        providerId: input.providerId,
+      };
+      if (result.idempotentReplay || result.inboxDuplicate) {
+        metricsRegistry.increment("idempotency_duplicates_total", { channel });
+        jsonLogger.event(
+          "info",
+          "Wager transaction duplicate detected.",
+          fields,
+          "SubmitWagerTransactionUseCase",
+        );
+      } else {
+        const outcome =
+          result.status === WagerTransactionStatus.PROCESSED
+            ? "processed"
+            : result.status === WagerTransactionStatus.REJECTED
+              ? "rejected"
+              : "pending";
+        jsonLogger.event(
+          "info",
+          `Wager transaction ${outcome}.`,
+          fields,
+          "SubmitWagerTransactionUseCase",
+        );
+      }
+      return result;
+    } catch (error) {
+      if (postgresErrorCode(error) === "55P03") {
+        metricsRegistry.increment("lock_conflicts_total");
+        jsonLogger.event(
+          "warn",
+          "Wallet lock timeout.",
+          {
+            ...currentLogContext(),
+            walletId: input.walletId,
+            providerId: input.providerId,
+          },
+          "SubmitWagerTransactionUseCase",
+        );
+      }
+      throw error;
+    }
+  }
+
+  private async executeTransaction(
     input: SubmitWagerTransactionInput,
   ): Promise<SubmitWagerTransactionOutput> {
     if (
@@ -176,6 +248,10 @@ export class SubmitWagerTransactionUseCase {
         referenceExternalTransactionId: input.referenceExternalTransactionId,
         createdAt,
       });
+      const correlationId =
+        input.correlationId ??
+        currentLogContext().correlationId ??
+        transaction.id;
 
       try {
         await tx.transactions.insert(transaction);
@@ -209,7 +285,7 @@ export class SubmitWagerTransactionUseCase {
             new WagerTransactionPendingReference({
               eventId: this.idGenerator.next(),
               aggregateId: transaction.walletId,
-              correlationId: input.correlationId ?? transaction.id,
+              correlationId,
               occurredAt: createdAt,
               data: {
                 transactionId: transaction.id,
@@ -234,7 +310,7 @@ export class SubmitWagerTransactionUseCase {
           transaction,
           wallet,
           reference,
-          input.correlationId ?? transaction.id,
+          correlationId,
           createdAt,
         );
         return complete({
@@ -291,7 +367,6 @@ export class SubmitWagerTransactionUseCase {
         }
       }
 
-      const correlationId = input.correlationId ?? transaction.id;
       if (transaction.status === WagerTransactionStatus.REJECTED) {
         await tx.transactions.save(transaction, wallet.balance);
         await enqueueIntegrationEvent(
@@ -364,4 +439,26 @@ export class SubmitWagerTransactionUseCase {
       });
     });
   }
+}
+
+function postgresErrorCode(error: unknown): string | undefined {
+  let current = error;
+  for (let depth = 0; depth < 6; depth += 1) {
+    if (typeof current !== "object" || current === null) {
+      return undefined;
+    }
+    if ("code" in current && typeof current.code === "string") {
+      return current.code;
+    }
+    if ("cause" in current) {
+      current = current.cause;
+    } else if ("originalError" in current) {
+      current = current.originalError;
+    } else if ("driverException" in current) {
+      current = current.driverException;
+    } else {
+      return undefined;
+    }
+  }
+  return undefined;
 }
